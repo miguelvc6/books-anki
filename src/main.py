@@ -7,7 +7,7 @@ import logging
 import os
 import re
 import unicodedata
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -125,6 +125,10 @@ class WiktextractLexicon:
                 genders = blob.get("genders")
                 if genders and not entry.genders:
                     entry.genders = [g for g in genders if g]
+                if not entry.genders:
+                    tag_genders = [t for t in (blob.get("tags") or []) if t in {"masculine", "feminine", "neuter", "common"}]
+                    if tag_genders:
+                        entry.genders = tag_genders
                 for form in blob.get("forms", []) or []:
                     tags = {t.lower() for t in form.get("tags", []) or []}
                     form_text = form.get("form")
@@ -135,6 +139,11 @@ class WiktextractLexicon:
                     form_key = (form_text.lower(), pos)
                     if key not in self._form_index[form_key]:
                         self._form_index[form_key].append(key)
+                    normalized_form = normalize_plural_form(form_text)
+                    if normalized_form:
+                        normalized_key = (normalized_form.lower(), pos)
+                        if key not in self._form_index[normalized_key]:
+                            self._form_index[normalized_key].append(key)
                     for tag in (
                         "infinitive",
                         "present 3rd",
@@ -193,20 +202,26 @@ class WiktextractLexicon:
     def lookup(self, lemma: str, pos: str) -> Optional[LexemeData]:
         return self._index.get((lemma.lower(), pos))
 
+
     def resolve(
         self, lemma: str, pos: str, surface: Optional[str] = None
     ) -> Tuple[str, Optional[LexemeData]]:
         for candidate in self._iter_candidates(lemma, surface):
             key = (candidate.lower(), pos)
             direct = self._index.get(key)
-            if direct:
-                return direct.lemma, direct
-            form_keys = self._form_index.get(key)
-            if form_keys:
-                target_key = form_keys[0]
-                lexeme = self._index.get(target_key)
-                if lexeme:
-                    return lexeme.lemma, lexeme
+            via_forms = self._resolve_from_forms(key)
+            chosen: Optional[LexemeData] = None
+            if direct and via_forms:
+                if self._prefer_lexeme(via_forms, direct, pos):
+                    chosen = via_forms
+                else:
+                    chosen = direct
+            elif direct:
+                chosen = direct
+            elif via_forms:
+                chosen = via_forms
+            if chosen:
+                return chosen.lemma, chosen
         return lemma, None
 
     @staticmethod
@@ -215,15 +230,59 @@ class WiktextractLexicon:
         for raw in (lemma, surface):
             if not raw:
                 continue
-            text = raw.strip()
-            if not text:
+            text_value = raw.strip()
+            if not text_value:
                 continue
-            for variant in (text, text.lower()):
+            for variant in (text_value, text_value.lower()):
                 if variant not in seen:
                     seen.add(variant)
                     yield variant
         if not seen and lemma:
             yield lemma
+
+    def _resolve_from_forms(self, key: Tuple[str, str]) -> Optional[LexemeData]:
+        form_keys = self._form_index.get(key)
+        if not form_keys:
+            return None
+        best: Optional[LexemeData] = None
+        best_score = -1
+        for target_key in form_keys:
+            lexeme = self._index.get(target_key)
+            if not lexeme:
+                continue
+            score = self._lexeme_score(lexeme, key[1])
+            if score > best_score:
+                best = lexeme
+                best_score = score
+        return best
+
+    def _lexeme_score(self, lexeme: LexemeData, pos: str) -> int:
+        score = 0
+        if pos == "NOUN":
+            if lexeme.genders:
+                score += 4
+            if lexeme.plurals:
+                score += 4
+        if pos == "VERB" and lexeme.verb_forms:
+            score += 3
+        if lexeme.translations:
+            score += 2
+        if lexeme.lemma:
+            score += max(0, 3 - lexeme.lemma.count(" "))
+        return score
+
+    def _prefer_lexeme(self, candidate: LexemeData, current: LexemeData, pos: str) -> bool:
+        if candidate is current:
+            return False
+        cand_score = self._lexeme_score(candidate, pos)
+        curr_score = self._lexeme_score(current, pos)
+        if cand_score != curr_score:
+            return cand_score > curr_score
+        cand_len = len(candidate.lemma or "")
+        curr_len = len(current.lemma or "")
+        if cand_len != curr_len:
+            return cand_len < curr_len
+        return (candidate.lemma or "") < (current.lemma or "")
 
     @staticmethod
     def _normalize_for_frequency(text: str) -> str:
@@ -320,8 +379,6 @@ class WiktextractLexicon:
                 continue
             return base, lexeme
         return None
-
-
 class LibreTranslateClient:
     def __init__(self, url: Optional[str], api_key: Optional[str] = None) -> None:
         self.url = url.rstrip("/") if url else None
@@ -375,6 +432,7 @@ class TermEntry:
     plural_alternatives: List[str] = field(default_factory=list)
     context_gender: Optional[str] = None
     context_number: Optional[str] = None
+    plural_candidates: Counter[str] = field(default_factory=Counter)
 
 
 def normalize_text(raw_text: str) -> str:
@@ -550,6 +608,8 @@ def infer_context_features(token) -> Tuple[Optional[str], Optional[str]]:
                 number = normalized_number
         if gender and number:
             break
+    if number == "plural":
+        gender = None
     return gender, number
 
 
@@ -738,6 +798,11 @@ def process_book(
                         entry.context_gender = context_gender
                     if context_number and not entry.context_number:
                         entry.context_number = context_number
+                    number_tags = token.morph.get("Number")
+                    if number_tags and "Plur" in number_tags:
+                        observed_plural = normalize_plural_form(token.text)
+                        if observed_plural:
+                            entry.plural_candidates[observed_plural] += 1
                 entry.frequency += 1
     entry_list = prune_pos_variants(list(entries.values()))
     for entry in entry_list:
@@ -767,6 +832,18 @@ def process_book(
                         parts.append(form)
                 if parts:
                     entry.verb_forms = " - ".join(parts)
+        if entry.pos == "NOUN" and not entry.plural and entry.plural_candidates:
+            ordered: List[str] = []
+            for form, _ in entry.plural_candidates.most_common():
+                if not form:
+                    continue
+                if form not in ordered:
+                    ordered.append(form)
+            if ordered:
+                entry.plural = ordered[0]
+                entry.plural_display = derive_plural_display(entry.lemma, entry.plural)
+                entry.plural_alternatives = [alt for alt in ordered[1:] if alt != entry.plural]
+
         if entry.pos == "NOUN" and not entry.gender and entry.context_gender:
             entry.gender = entry.context_gender
         if not translations:
