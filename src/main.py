@@ -225,6 +225,102 @@ class WiktextractLexicon:
         if not seen and lemma:
             yield lemma
 
+    @staticmethod
+    def _normalize_for_frequency(text: str) -> str:
+        normalized = re.sub(r"[^a-zA-Z\u00e4\u00f6\u00fc\u00df]", "", text.lower())
+        return normalized
+
+    @staticmethod
+    def _base_variants(text: str) -> List[str]:
+        variants: List[str] = []
+        if not text:
+            return variants
+        stripped = text.strip()
+        if not stripped:
+            return variants
+        lowered = stripped.lower()
+        for value in (stripped, lowered):
+            if value and value not in variants:
+                variants.append(value)
+        san_apostrophe = re.sub(r"[\u2019']", "", lowered)
+        if san_apostrophe and san_apostrophe not in variants:
+            variants.append(san_apostrophe)
+        apostrophe_suffix = re.sub(r"(?:[\u2019']s)$", "", lowered)
+        if apostrophe_suffix and apostrophe_suffix not in variants:
+            variants.append(apostrophe_suffix)
+        return variants
+
+    @staticmethod
+    def _expand_verb_forms(stem: str) -> List[str]:
+        variants: List[str] = []
+        if not stem:
+            return variants
+        stem = stem.lower()
+        variants.append(stem)
+        if stem.endswith("end") and len(stem) > 3:
+            variants.append(stem[:-1])
+        if stem.endswith("st") and len(stem) > 2:
+            root = stem[:-2]
+            if root:
+                variants.append(root)
+                variants.append(root + "en")
+        if stem.endswith("t") and len(stem) > 1:
+            root = stem[:-1]
+            variants.append(root)
+            variants.append(root + "en")
+        if stem.endswith("e") and len(stem) > 1:
+            root = stem[:-1]
+            variants.append(root)
+            variants.append(root + "en")
+        if not stem.endswith("en"):
+            variants.append(stem + "en")
+        return variants
+
+    def _iter_infinitive_candidates(self, lemma: str, surface: Optional[str]) -> Iterable[str]:
+        seen: Set[str] = set()
+        sources: List[str] = [lemma]
+        if surface:
+            sources.append(surface)
+        for raw in sources:
+            for base in self._base_variants(raw):
+                for candidate in self._expand_verb_forms(base):
+                    cleaned = re.sub(r"[^a-zA-Z\u00e4\u00f6\u00fc\u00df]", "", candidate)
+                    if len(cleaned) < 3:
+                        continue
+                    if cleaned not in seen:
+                        seen.add(cleaned)
+                        yield cleaned
+
+    def suggest_verb_infinitive(
+        self, lemma: str, surface: Optional[str]
+    ) -> Optional[Tuple[str, LexemeData]]:
+        current_freq = zipf_frequency(self._normalize_for_frequency(lemma), "de")
+        for candidate in self._iter_infinitive_candidates(lemma, surface):
+            key = (candidate, "VERB")
+            lexeme = self._index.get(key)
+            if not lexeme:
+                form_keys = self._form_index.get(key)
+                if form_keys:
+                    for target_key in form_keys:
+                        lexeme = self._index.get(target_key)
+                        if lexeme:
+                            break
+            if not lexeme:
+                continue
+            base = lexeme.verb_forms.get("infinitive")
+            if not base and lexeme.lemma.lower().endswith("en"):
+                base = lexeme.lemma
+            if not base:
+                continue
+            base_clean = self._normalize_for_frequency(base)
+            if not base_clean or base_clean == self._normalize_for_frequency(lemma):
+                continue
+            base_freq = zipf_frequency(base_clean, "de")
+            if base_freq <= current_freq + 0.15:
+                continue
+            return base, lexeme
+        return None
+
 
 class LibreTranslateClient:
     def __init__(self, url: Optional[str], api_key: Optional[str] = None) -> None:
@@ -618,15 +714,21 @@ def process_book(
                 )
                 pos = token.pos_
                 lemma_candidate = raw_lemma.strip()
-                lemma_candidate, _ = lexicon.resolve(lemma_candidate, pos, token.text)
-                lemma = canonicalize_lemma_casing(lemma_candidate, pos)
+                lemma_candidate, lexeme = lexicon.resolve(lemma_candidate, pos, token.text)
+                resolved_pos = lexeme.pos if lexeme else pos
+                if resolved_pos != "VERB" or not lexeme or not lexeme.verb_forms.get("infinitive"):
+                    suggestion = lexicon.suggest_verb_infinitive(lemma_candidate, token.text)
+                    if suggestion:
+                        lemma_candidate, lexeme = suggestion
+                        resolved_pos = "VERB"
+                lemma = canonicalize_lemma_casing(lemma_candidate, resolved_pos)
                 lemma_key = lemma.lower()
                 if lemma_key in seen_global:
                     continue
-                entry_key = (lemma_key, pos)
+                entry_key = (lemma_key, resolved_pos)
                 entry = entries.get(entry_key)
                 if not entry:
-                    entry = TermEntry(lemma=lemma, pos=pos, surface=token.text)
+                    entry = TermEntry(lemma=lemma, pos=resolved_pos, surface=token.text)
                     entry.example_sentence = sent.text.strip()
                     entry.example_cloze = make_cloze(entry.example_sentence, token.text)
                     entries[entry_key] = entry
