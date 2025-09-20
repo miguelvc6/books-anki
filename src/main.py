@@ -1,5 +1,4 @@
 """Command-line pipeline to extract German vocabulary from Harry Potter books and build Anki decks."""
-
 from __future__ import annotations
 
 import argparse
@@ -8,13 +7,15 @@ import logging
 import os
 import re
 import unicodedata
+from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import ftfy
 import pandas as pd
 import requests
+from wordfreq import zipf_frequency
 
 try:
     import spacy
@@ -45,6 +46,13 @@ SEPARABLE_PREFIXES = {
     "zur\u00fcck",
     "zusammen",
 }
+POS_PRIORITY = {
+    "NOUN": 4,
+    "VERB": 3,
+    "ADJ": 2,
+    "ADV": 1,
+}
+ARTICLE_PATTERN = re.compile(r"^(?:der|die|das|den|dem|des|ein|eine|einen|einem|eines)\s+", re.IGNORECASE)
 MT_DEFAULT_URL = os.environ.get("LIBRETRANSLATE_URL")
 MT_API_KEY = os.environ.get("LIBRETRANSLATE_API_KEY")
 DEFAULT_WIKTEXTRACT_PATH = Path("data/de-extract.jsonl.gz") if Path("data/de-extract.jsonl.gz").exists() else None
@@ -75,6 +83,7 @@ class WiktextractLexicon:
     def __init__(self, path: Optional[Path]) -> None:
         self.path = path
         self._index: Dict[Tuple[str, str], LexemeData] = {}
+        self._form_index: Dict[Tuple[str, str], List[Tuple[str, str]]] = defaultdict(list)
         if self.path and self.path.exists():
             self._build_index()
         else:
@@ -123,6 +132,9 @@ class WiktextractLexicon:
                         continue
                     if "plural" in tags and form_text not in entry.plurals:
                         entry.plurals.append(form_text)
+                    form_key = (form_text.lower(), pos)
+                    if key not in self._form_index[form_key]:
+                        self._form_index[form_key].append(key)
                     for tag in (
                         "infinitive",
                         "present 3rd",
@@ -181,6 +193,38 @@ class WiktextractLexicon:
     def lookup(self, lemma: str, pos: str) -> Optional[LexemeData]:
         return self._index.get((lemma.lower(), pos))
 
+    def resolve(
+        self, lemma: str, pos: str, surface: Optional[str] = None
+    ) -> Tuple[str, Optional[LexemeData]]:
+        for candidate in self._iter_candidates(lemma, surface):
+            key = (candidate.lower(), pos)
+            direct = self._index.get(key)
+            if direct:
+                return direct.lemma, direct
+            form_keys = self._form_index.get(key)
+            if form_keys:
+                target_key = form_keys[0]
+                lexeme = self._index.get(target_key)
+                if lexeme:
+                    return lexeme.lemma, lexeme
+        return lemma, None
+
+    @staticmethod
+    def _iter_candidates(lemma: Optional[str], surface: Optional[str]) -> Iterable[str]:
+        seen: Set[str] = set()
+        for raw in (lemma, surface):
+            if not raw:
+                continue
+            text = raw.strip()
+            if not text:
+                continue
+            for variant in (text, text.lower()):
+                if variant not in seen:
+                    seen.add(variant)
+                    yield variant
+        if not seen and lemma:
+            yield lemma
+
 
 class LibreTranslateClient:
     def __init__(self, url: Optional[str], api_key: Optional[str] = None) -> None:
@@ -232,12 +276,17 @@ class TermEntry:
     translations: List[str] = field(default_factory=list)
     translation_source: Optional[str] = None
     verb_forms: Optional[str] = None
+    plural_alternatives: List[str] = field(default_factory=list)
+    context_gender: Optional[str] = None
+    context_number: Optional[str] = None
 
 
 def normalize_text(raw_text: str) -> str:
     text = ftfy.fix_text(raw_text)
     text = text.replace("\r\n", "\n")
+    text = text.replace("\xa0", " ")
     text = re.sub(r"-\s*\n", "", text)
+    text = re.sub(r"(?<=\s)[\-\u2010\u2011\u2012\u2013\u2212](?=\w)", "- ", text)
     text = unicodedata.normalize("NFC", text)
     return text
 
@@ -310,9 +359,167 @@ def is_candidate(token) -> bool:
         return False
     if token.like_num:
         return False
+    text = token.text.strip()
+    dash_chars = ('-', chr(0x2013), chr(0x2014))
+    if text.startswith(dash_chars):
+        return False
+    stripped = text.strip(''.join(dash_chars))
+    if any(char.isdigit() for char in text):
+        return False
+    if text.isupper() and len(text) > 1:
+        return False
+    if '-' in text:
+        first_segment, _, rest_segment = text.partition('-')
+        if len(first_segment) == 1 and rest_segment and rest_segment[0].isalpha() and first_segment.lower() == rest_segment[0].lower():
+            return False
+    if len(stripped) <= 4 and len({ch.lower() for ch in stripped if ch.isalpha()}) <= 2:
+        return False
+    if re.search(r'[A-Za-zÄÖÜäöüß]-[A-Za-zÄÖÜäöüß]-', text):
+        return False
+    if not stripped or not any(char.isalpha() for char in stripped):
+        return False
+    if token.is_punct:
+        return False
     if token.pos_ == "ADV" and token.is_stop:
         return True
     return True
+
+
+
+def normalize_gender_tag(raw: Optional[str]) -> Optional[str]:
+    if not raw:
+        return None
+    mapping = {
+        "masculine": "masculine",
+        "feminine": "feminine",
+        "neuter": "neuter",
+        "m": "masculine",
+        "f": "feminine",
+        "n": "neuter",
+        "masc": "masculine",
+        "fem": "feminine",
+        "neut": "neuter",
+        "common": "common",
+    }
+    return mapping.get(raw.lower())
+
+
+def normalize_number_tag(raw: Optional[str]) -> Optional[str]:
+    if not raw:
+        return None
+    mapping = {
+        "sing": "singular",
+        "plur": "plural",
+        "dual": "dual",
+        "singular": "singular",
+        "plural": "plural",
+    }
+    return mapping.get(raw.lower())
+
+
+def infer_context_features(token) -> Tuple[Optional[str], Optional[str]]:
+    gender = None
+    number = None
+    gender_tags = token.morph.get("Gender")
+    if gender_tags:
+        gender = normalize_gender_tag(gender_tags[0])
+    number_tags = token.morph.get("Number")
+    if number_tags:
+        number = normalize_number_tag(number_tags[0])
+    determiner_candidates = [child for child in token.children if child.pos_ == "DET"]
+    neighbors = []
+    if token.i > 0:
+        try:
+            neighbors.append(token.doc[token.i - 1])
+        except IndexError:
+            pass
+    if token.i + 1 < len(token.doc):
+        try:
+            neighbors.append(token.doc[token.i + 1])
+        except IndexError:
+            pass
+    for neighbor in neighbors:
+        if neighbor.pos_ == "DET" and neighbor not in determiner_candidates:
+            determiner_candidates.append(neighbor)
+    for det in determiner_candidates:
+        det_gender = det.morph.get("Gender")
+        if det_gender:
+            normalized = normalize_gender_tag(det_gender[0])
+            if normalized:
+                gender = normalized
+        det_number = det.morph.get("Number")
+        if det_number:
+            normalized_number = normalize_number_tag(det_number[0])
+            if normalized_number:
+                number = normalized_number
+        if gender and number:
+            break
+    return gender, number
+
+
+def canonicalize_lemma_casing(lemma: str, pos: str) -> str:
+    if not lemma:
+        return lemma
+    if pos == "NOUN":
+        return lemma[0].upper() + lemma[1:]
+    return lemma.lower()
+
+
+def prune_pos_variants(entries: List[TermEntry]) -> List[TermEntry]:
+    best: Dict[str, TermEntry] = {}
+    for entry in entries:
+        key = entry.lemma.lower()
+        priority = POS_PRIORITY.get(entry.pos, 0)
+        existing = best.get(key)
+        if not existing:
+            best[key] = entry
+            continue
+        existing_priority = POS_PRIORITY.get(existing.pos, 0)
+        if priority > existing_priority:
+            best[key] = entry
+            continue
+        if priority == existing_priority and entry.frequency > existing.frequency:
+            best[key] = entry
+    return list(best.values())
+
+
+def normalize_plural_form(form: str) -> str:
+    cleaned = unicodedata.normalize("NFC", form.strip())
+    cleaned = ARTICLE_PATTERN.sub("", cleaned)
+    cleaned = cleaned.strip(" ,.;:'\"()")
+    return cleaned
+
+
+def select_plural(plurals: Sequence[str], lemma: str) -> Tuple[str, List[str]]:
+    seen = []
+    for plural in plurals:
+        normalized = normalize_plural_form(plural)
+        if not normalized:
+            continue
+        if normalized not in seen:
+            seen.append(normalized)
+    if not seen:
+        fallback = normalize_plural_form(plurals[0]) if plurals else ""
+        return fallback, []
+    scored = []
+    priority_map = {
+        "-e": 5,
+        "-en": 4,
+        "-er": 4,
+        "-¨er": 4,
+        "-n": 3,
+        "-": 2,
+        "-s": 1,
+    }
+    for plural in seen:
+        freq = zipf_frequency(plural, "de")
+        display = derive_plural_display(lemma, plural) or ""
+        priority = priority_map.get(display, 2)
+        scored.append((priority, freq, -len(plural), plural))
+    scored.sort(reverse=True)
+    preferred = scored[0][3]
+    alternatives = [plural for plural in seen if plural != preferred]
+    return preferred, alternatives
 
 
 def make_cloze(sentence: str, surface: str) -> str:
@@ -344,31 +551,35 @@ def derive_plural_display(lemma: str, plural: Optional[str]) -> Optional[str]:
 
 
 def article_from_gender(gender: Optional[str]) -> Optional[str]:
+    gender_norm = normalize_gender_tag(gender)
     mapping = {
         "masculine": "der",
         "feminine": "die",
         "neuter": "das",
-        "m": "der",
-        "f": "die",
-        "n": "das",
+        "common": "die",
     }
-    if not gender:
+    if not gender_norm:
         return None
-    return mapping.get(gender.lower())
+    return mapping.get(gender_norm)
 
 
-def format_front(entry: TermEntry) -> str:
+def format_front(entry: TermEntry, *, annotate_pos: bool = False) -> str:
     if entry.pos == "NOUN":
         article = article_from_gender(entry.gender) or ""
         lemma = entry.lemma
         plural = entry.plural_display or entry.plural or "-"
         core = " ".join(part for part in (article, lemma) if part)
-        return f"{core}, {plural}"
-    if entry.pos == "VERB":
+        base = f"{core}, {plural}"
+    elif entry.pos == "VERB":
         if entry.verb_forms:
-            return f"{entry.lemma} ({entry.verb_forms})"
-        return entry.lemma
-    return entry.lemma
+            base = f"{entry.lemma} ({entry.verb_forms})"
+        else:
+            base = entry.lemma
+    else:
+        base = entry.lemma
+    if annotate_pos:
+        return f"{base} [{entry.pos.lower()}]"
+    return base
 
 
 def format_back(entry: TermEntry) -> str:
@@ -390,8 +601,8 @@ def process_book(
     nlp: Language,
     lexicon: WiktextractLexicon,
     mt_client: LibreTranslateClient,
-    seen_global: Set[Tuple[str, str]],
-) -> Tuple[List[TermEntry], Set[Tuple[str, str]]]:
+    seen_global: Set[str],
+) -> Tuple[List[TermEntry], Set[str]]:
     LOGGER.info("Processing book %s", path.name)
     raw_text = path.read_text(encoding="utf-8")
     text = normalize_text(raw_text)
@@ -402,21 +613,32 @@ def process_book(
             for token in sent:
                 if not is_candidate(token):
                     continue
-                lemma = (
+                raw_lemma = (
                     reconstruct_lemma(token) if token.pos_ == "VERB" else token.lemma_
                 )
                 pos = token.pos_
-                key = (lemma.lower(), pos)
-                if key in seen_global:
+                lemma_candidate = raw_lemma.strip()
+                lemma_candidate, _ = lexicon.resolve(lemma_candidate, pos, token.text)
+                lemma = canonicalize_lemma_casing(lemma_candidate, pos)
+                lemma_key = lemma.lower()
+                if lemma_key in seen_global:
                     continue
-                entry = entries.get(key)
+                entry_key = (lemma_key, pos)
+                entry = entries.get(entry_key)
                 if not entry:
                     entry = TermEntry(lemma=lemma, pos=pos, surface=token.text)
                     entry.example_sentence = sent.text.strip()
                     entry.example_cloze = make_cloze(entry.example_sentence, token.text)
-                    entries[key] = entry
+                    entries[entry_key] = entry
+                if pos == "NOUN":
+                    context_gender, context_number = infer_context_features(token)
+                    if context_gender and not entry.context_gender:
+                        entry.context_gender = context_gender
+                    if context_number and not entry.context_number:
+                        entry.context_number = context_number
                 entry.frequency += 1
-    for key, entry in entries.items():
+    entry_list = prune_pos_variants(list(entries.values()))
+    for entry in entry_list:
         lexeme = lexicon.lookup(entry.lemma, entry.pos)
         translations: List[str] = []
         if lexeme:
@@ -424,12 +646,12 @@ def process_book(
                 translations = lexeme.translations
             if entry.pos == "NOUN":
                 if lexeme.genders:
-                    entry.gender = lexeme.genders[0]
+                    entry.gender = normalize_gender_tag(lexeme.genders[0])
                 if lexeme.plurals:
-                    entry.plural = lexeme.plurals[0]
-                    entry.plural_display = derive_plural_display(
-                        entry.lemma, entry.plural
-                    )
+                    plural, alternatives = select_plural(lexeme.plurals, entry.lemma)
+                    entry.plural = plural
+                    entry.plural_alternatives = alternatives
+                    entry.plural_display = derive_plural_display(entry.lemma, entry.plural)
             if entry.pos == "VERB" and lexeme.verb_forms:
                 parts = []
                 for tag in (
@@ -443,6 +665,8 @@ def process_book(
                         parts.append(form)
                 if parts:
                     entry.verb_forms = " - ".join(parts)
+        if entry.pos == "NOUN" and not entry.gender and entry.context_gender:
+            entry.gender = entry.context_gender
         if not translations:
             mt = mt_client.translate(entry.lemma)
             if mt:
@@ -452,22 +676,32 @@ def process_book(
             entry.translation_source = "dictionary"
         if translations:
             entry.translations = translations
-    seen_keys = set(entries.keys())
-    return list(entries.values()), seen_keys
+    seen_keys = {entry.lemma.lower() for entry in entry_list}
+    return entry_list, seen_keys
 
 
 def to_records(entries: List[TermEntry], book_label: str) -> List[Dict[str, object]]:
     records: List[Dict[str, object]] = []
-    for entry in entries:
+    base_fronts: Dict[str, Set[str]] = {}
+    cache: Dict[int, str] = {}
+    for idx, entry in enumerate(entries):
+        base = format_front(entry)
+        cache[idx] = base
+        base_fronts.setdefault(base, set()).add(entry.pos)
+    for idx, entry in enumerate(entries):
+        base = cache[idx]
+        annotate = len(base_fronts.get(base, set())) > 1
+        front_value = format_front(entry, annotate_pos=annotate)
         records.append(
             {
-                "front": format_front(entry),
+                "front": front_value,
                 "back": format_back(entry),
                 "lemma": entry.lemma,
                 "pos": entry.pos,
                 "gender": entry.gender,
                 "plural": entry.plural,
                 "plural_display": entry.plural_display,
+                "plural_alternatives": "; ".join(entry.plural_alternatives),
                 "translations": "; ".join(entry.translations),
                 "translation_source": entry.translation_source,
                 "example": entry.example_sentence,
@@ -491,7 +725,7 @@ def run_pipeline(config: PipelineConfig) -> None:
         book_paths = book_paths[: config.limit_books]
     if not book_paths:
         raise SystemExit(f"No .txt files found in {config.input_dir}")
-    seen_global: Set[Tuple[str, str]] = set()
+    seen_global: Set[str] = set()
     for idx, book_path in enumerate(book_paths, start=1):
         entries, seen = process_book(book_path, nlp, lexicon, mt_client, seen_global)
         seen_global.update(seen)
