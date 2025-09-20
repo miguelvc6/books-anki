@@ -507,15 +507,21 @@ def run_pipeline(config: PipelineConfig) -> None:
 def parse_args(argv: Optional[Sequence[str]] = None) -> PipelineConfig:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "--book-name",
+        type=str,
+        default="harry-potter",
+        help="Name of the folder inside data/raw to process",
+    )
+    parser.add_argument(
         "--input-dir",
         type=Path,
-        default=Path("data/raw/harry-potter"),
+        default=None,
         help="Directory with raw German book .txt files",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("data/processed"),
+        default=None,
         help="Where to write deck CSV files",
     )
     parser.add_argument(
@@ -555,6 +561,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> PipelineConfig:
         help="Logging verbosity",
     )
     args = parser.parse_args(argv)
+    if args.input_dir is None:
+        args.input_dir = Path("data/raw") / args.book_name
+    if args.output_dir is None:
+        args.output_dir = Path("data/processed") / args.book_name
     logging.basicConfig(
         level=getattr(logging, args.log_level), format="%(levelname)s %(message)s"
     )
