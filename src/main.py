@@ -76,6 +76,7 @@ class LexemeData:
     genders: List[str] = field(default_factory=list)
     plurals: List[str] = field(default_factory=list)
     translations: List[str] = field(default_factory=list)
+    translations_en: List[str] = field(default_factory=list)
     verb_forms: Dict[str, str] = field(default_factory=dict)
 
 
@@ -160,13 +161,19 @@ class WiktextractLexicon:
                             or translation.get("language_code")
                             or translation.get("lang")
                         )
-                        if lang_code not in {
+                        lang = str(lang_code).lower() if isinstance(lang_code, str) else None
+                        target_list: List[str]
+                        if lang in {
                             "es",
                             "spa",
                             "spanish",
                             "espanol",
                             "espa\u00f1ol",
                         }:
+                            target_list = entry.translations
+                        elif lang in {"en", "eng", "english"}:
+                            target_list = entry.translations_en
+                        else:
                             continue
                         word = translation.get("word")
                         if not word:
@@ -182,8 +189,9 @@ class WiktextractLexicon:
                             formatted = f"{word} ({'; '.join(note_bits)})"
                         else:
                             formatted = word
-                        if formatted not in entry.translations:
-                            entry.translations.append(formatted)
+                        formatted = formatted.strip()
+                        if formatted and formatted not in target_list:
+                            target_list.append(formatted)
         LOGGER.info("Loaded %s lexemes from wiktextract", len(self._index))
 
     @staticmethod
@@ -201,6 +209,45 @@ class WiktextractLexicon:
 
     def lookup(self, lemma: str, pos: str) -> Optional[LexemeData]:
         return self._index.get((lemma.lower(), pos))
+
+    def get_dictionary_glosses(self, lemma: str, pos: str, *, prefer_es: bool = True, max_n: int = 2) -> tuple[list[str], str | None]:
+        """
+        Devuelve (glosses, source), donde source es 'dictionary-es' o 'dictionary-en' o None si no hay.
+        """
+        lexeme = self.lookup(lemma, pos)
+        if not lexeme:
+            _, lexeme = self.resolve(lemma, pos)
+        if not lexeme:
+            return [], None
+
+        def pick(values: Sequence[str] | None) -> list[str]:
+            seen: Set[str] = set()
+            result: list[str] = []
+            if not values:
+                return result
+            for value in values:
+                normalized = re.sub(r"\s+", " ", value).strip()
+                if not normalized:
+                    continue
+                key = normalized.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                result.append(normalized)
+                if len(result) >= max_n:
+                    break
+            return result
+
+        order = (
+            ((lexeme.translations, "dictionary-es"), (lexeme.translations_en, "dictionary-en"))
+            if prefer_es
+            else ((lexeme.translations_en, "dictionary-en"), (lexeme.translations, "dictionary-es"))
+        )
+        for candidates, source in order:
+            cleaned = pick(candidates)
+            if cleaned:
+                return cleaned, source
+        return [], None
 
 
     def resolve(
@@ -265,7 +312,7 @@ class WiktextractLexicon:
                 score += 4
         if pos == "VERB" and lexeme.verb_forms:
             score += 3
-        if lexeme.translations:
+        if lexeme.translations or lexeme.translations_en:
             score += 2
         if lexeme.lemma:
             score += max(0, 3 - lexeme.lemma.count(" "))
@@ -807,10 +854,7 @@ def process_book(
     entry_list = prune_pos_variants(list(entries.values()))
     for entry in entry_list:
         lexeme = lexicon.lookup(entry.lemma, entry.pos)
-        translations: List[str] = []
         if lexeme:
-            if lexeme.translations:
-                translations = lexeme.translations
             if entry.pos == "NOUN":
                 if lexeme.genders:
                     entry.gender = normalize_gender_tag(lexeme.genders[0])
@@ -846,15 +890,33 @@ def process_book(
 
         if entry.pos == "NOUN" and not entry.gender and entry.context_gender:
             entry.gender = entry.context_gender
-        if not translations:
-            mt = mt_client.translate(entry.lemma)
-            if mt:
-                translations = mt
-                entry.translation_source = "mt"
+
+        glosses, source = lexicon.get_dictionary_glosses(entry.lemma, entry.pos, prefer_es=True, max_n=2)
+        if glosses:
+            entry.translations = glosses
+            entry.translation_source = source
         else:
-            entry.translation_source = "dictionary"
-        if translations:
-            entry.translations = translations
+            entry.translations = []
+            entry.translation_source = None
+
+    total_entries = len(entry_list)
+    dict_es = sum(1 for entry in entry_list if entry.translation_source == "dictionary-es")
+    dict_en = sum(1 for entry in entry_list if entry.translation_source == "dictionary-en")
+    dict_none = max(total_entries - dict_es - dict_en, 0)
+    if total_entries:
+        pct_es = dict_es / total_entries * 100
+        pct_en = dict_en / total_entries * 100
+        pct_none = dict_none / total_entries * 100
+    else:
+        pct_es = pct_en = pct_none = 0.0
+    LOGGER.info(
+        "Dictionary coverage for %s: %.1f%% ES, %.1f%% EN, %.1f%% none",
+        path.name,
+        pct_es,
+        pct_en,
+        pct_none,
+    )
+
     seen_keys = {entry.lemma.lower() for entry in entry_list}
     return entry_list, seen_keys
 
@@ -894,6 +956,14 @@ def to_records(entries: List[TermEntry], book_label: str) -> List[Dict[str, obje
 
 def run_pipeline(config: PipelineConfig) -> None:
     config.output_dir.mkdir(parents=True, exist_ok=True)
+    if not (config.wiktextract_path and config.wiktextract_path.exists()):
+        if config.wiktextract_path:
+            LOGGER.warning(
+                "Wiktextract dataset not found at %s; dictionary glosses will be unavailable.",
+                config.wiktextract_path,
+            )
+        else:
+            LOGGER.warning("Wiktextract dataset not configured; dictionary glosses will be unavailable.")
     nlp = load_model(config.force_model)
     lexicon = WiktextractLexicon(config.wiktextract_path)
     mt_client = LibreTranslateClient(
