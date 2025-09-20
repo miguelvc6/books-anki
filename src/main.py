@@ -1,4 +1,5 @@
 """Command-line pipeline to extract German vocabulary from Harry Potter books and build Anki decks."""
+
 from __future__ import annotations
 
 import argparse
@@ -46,6 +47,7 @@ SEPARABLE_PREFIXES = {
 }
 MT_DEFAULT_URL = os.environ.get("LIBRETRANSLATE_URL")
 MT_API_KEY = os.environ.get("LIBRETRANSLATE_API_KEY")
+DEFAULT_WIKTEXTRACT_PATH = Path("data/de-extract.jsonl.gz") if Path("data/de-extract.jsonl.gz").exists() else None
 
 
 @dataclass
@@ -82,14 +84,16 @@ class WiktextractLexicon:
 
     def _build_index(self) -> None:
         LOGGER.info("Loading wiktextract dataset from %s", self.path)
-        opener = open
         if self.path.suffix == ".gz":
             import gzip
 
-            def opener(file_path: Path, mode: str):
-                return gzip.open(file_path, mode)
+            def open_stream(file_path: Path):
+                return gzip.open(file_path, "rt", encoding="utf-8")
+        else:
+            def open_stream(file_path: Path):
+                return open(file_path, "rt", encoding="utf-8")
 
-        with opener(self.path, "rt", encoding="utf-8") as handle:  # type: ignore[arg-type]
+        with open_stream(self.path) as handle:
             for line in handle:
                 line = line.strip()
                 if not line:
@@ -135,7 +139,13 @@ class WiktextractLexicon:
                             or translation.get("language_code")
                             or translation.get("lang")
                         )
-                        if lang_code not in {"es", "spa", "spanish", "espanol", "espa\u00f1ol"}:
+                        if lang_code not in {
+                            "es",
+                            "spa",
+                            "spanish",
+                            "espanol",
+                            "espa\u00f1ol",
+                        }:
                             continue
                         word = translation.get("word")
                         if not word:
@@ -198,7 +208,11 @@ class LibreTranslateClient:
             return None
         translation = data.get("translatedText") or data.get("translated_text")
         if translation:
-            variants = [variant.strip() for variant in re.split(r"[,;/]", translation) if variant.strip()]
+            variants = [
+                variant.strip()
+                for variant in re.split(r"[,;/]", translation)
+                if variant.strip()
+            ]
             self.cache[text] = variants
             return variants
         return None
@@ -234,7 +248,11 @@ def split_paragraphs(text: str) -> List[str]:
 
 
 def load_model(force_name: Optional[str] = None) -> Language:
-    candidates = [force_name] if force_name else ["de_core_news_lg", "de_core_news_md", "de_core_news_sm"]
+    candidates = (
+        [force_name]
+        if force_name
+        else ["de_core_news_lg", "de_core_news_md", "de_core_news_sm"]
+    )
     for name in candidates:
         if not name:
             continue
@@ -360,8 +378,10 @@ def format_back(entry: TermEntry) -> str:
 
 
 def sanitize_book_name(path: Path) -> str:
-    base = path.stem.lower()
-    base = re.sub(r"[^a-z0-9]+", "_", base)
+    stem = path.stem.lower()
+    normalized = unicodedata.normalize("NFKD", stem)
+    ascii_friendly = ''.join(ch for ch in normalized if not unicodedata.combining(ch))
+    base = re.sub(r"[^a-z0-9]+", "_", ascii_friendly)
     return base.strip("_")
 
 
@@ -382,7 +402,9 @@ def process_book(
             for token in sent:
                 if not is_candidate(token):
                     continue
-                lemma = reconstruct_lemma(token) if token.pos_ == "VERB" else token.lemma_
+                lemma = (
+                    reconstruct_lemma(token) if token.pos_ == "VERB" else token.lemma_
+                )
                 pos = token.pos_
                 key = (lemma.lower(), pos)
                 if key in seen_global:
@@ -405,7 +427,9 @@ def process_book(
                     entry.gender = lexeme.genders[0]
                 if lexeme.plurals:
                     entry.plural = lexeme.plurals[0]
-                    entry.plural_display = derive_plural_display(entry.lemma, entry.plural)
+                    entry.plural_display = derive_plural_display(
+                        entry.lemma, entry.plural
+                    )
             if entry.pos == "VERB" and lexeme.verb_forms:
                 parts = []
                 for tag in (
@@ -459,7 +483,9 @@ def run_pipeline(config: PipelineConfig) -> None:
     config.output_dir.mkdir(parents=True, exist_ok=True)
     nlp = load_model(config.force_model)
     lexicon = WiktextractLexicon(config.wiktextract_path)
-    mt_client = LibreTranslateClient(config.mt_url or MT_DEFAULT_URL, config.mt_api_key or MT_API_KEY)
+    mt_client = LibreTranslateClient(
+        config.mt_url or MT_DEFAULT_URL, config.mt_api_key or MT_API_KEY
+    )
     book_paths = sorted(config.input_dir.glob("*.txt"))
     if config.limit_books is not None:
         book_paths = book_paths[: config.limit_books]
@@ -495,7 +521,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> PipelineConfig:
     parser.add_argument(
         "--wiktextract",
         type=Path,
-        default=None,
+        default=DEFAULT_WIKTEXTRACT_PATH,
         help="Path to wiktextract German JSONL(.gz) dump",
     )
     parser.add_argument(
@@ -529,7 +555,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> PipelineConfig:
         help="Logging verbosity",
     )
     args = parser.parse_args(argv)
-    logging.basicConfig(level=getattr(logging, args.log_level), format="%(levelname)s %(message)s")
+    logging.basicConfig(
+        level=getattr(logging, args.log_level), format="%(levelname)s %(message)s"
+    )
     return PipelineConfig(
         input_dir=args.input_dir,
         output_dir=args.output_dir,
