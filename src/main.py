@@ -103,6 +103,18 @@ class WiktextractLexicon:
             def open_stream(file_path: Path):
                 return open(file_path, "rt", encoding="utf-8")
 
+        def _dedup_keep_order(xs: list[str]) -> list[str]:
+            seen: set[str] = set()
+            out: list[str] = []
+            for x in xs:
+                k = x.lower()
+                if k in seen:
+                    continue
+                seen.add(k)
+                out.append(x)
+            return out
+
+        debug_targets = {("Hund", "NOUN"), ("gehen", "VERB"), ("aufstehen", "VERB")}
         with open_stream(self.path) as handle:
             for line in handle:
                 line = line.strip()
@@ -192,6 +204,28 @@ class WiktextractLexicon:
                         formatted = formatted.strip()
                         if formatted and formatted not in target_list:
                             target_list.append(formatted)
+                    glosses = sense.get("glosses") or []
+                    for gloss in glosses:
+                        if not isinstance(gloss, str):
+                            continue
+                        g = re.sub(r"\s+", " ", gloss).strip()
+                        if not g:
+                            continue
+                        if g not in entry.translations_en:
+                            entry.translations_en.append(g)
+                entry.translations = _dedup_keep_order(entry.translations)
+                entry.translations_en = _dedup_keep_order(entry.translations_en)
+                if (
+                    LOGGER.isEnabledFor(logging.DEBUG)
+                    and (entry.lemma, entry.pos) in debug_targets
+                ):
+                    LOGGER.debug(
+                        "Lexeme %s/%s: ES=%d EN=%d",
+                        entry.lemma,
+                        entry.pos,
+                        len(entry.translations),
+                        len(entry.translations_en),
+                    )
         LOGGER.info("Loaded %s lexemes from wiktextract", len(self._index))
 
     @staticmethod
@@ -916,6 +950,10 @@ def process_book(
         pct_en,
         pct_none,
     )
+    if LOGGER.isEnabledFor(logging.DEBUG):
+        examples = [e for e in entry_list if e.translation_source == "dictionary-en"][:5]
+        for ex in examples:
+            LOGGER.debug("Example EN gloss: %s [%s] -> %s", ex.lemma, ex.pos, ex.translations)
 
     seen_keys = {entry.lemma.lower() for entry in entry_list}
     return entry_list, seen_keys
