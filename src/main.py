@@ -497,7 +497,7 @@ def run_pipeline(config: PipelineConfig) -> None:
         seen_global.update(seen)
         records = to_records(entries, book_path.stem)
         frame = pd.DataFrame(records)
-        output_name = f"{idx:02d}_{sanitize_book_name(book_path)}.csv"
+        output_name = f"{sanitize_book_name(book_path)}.csv"
         output_path = config.output_dir / output_name
         LOGGER.info("Writing %s entries to %s", len(frame), output_path)
         frame.sort_values(by=["pos", "lemma"], inplace=True)
