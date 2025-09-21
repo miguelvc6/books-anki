@@ -227,11 +227,24 @@ class WiktextractLexicon:
         raw = raw.lower()
         mapping = {
             "noun": "NOUN",
+            "substantiv": "NOUN",
+            "substantive": "NOUN",
             "verb": "VERB",
             "adjective": "ADJ",
+            "adjektiv": "ADJ",
             "adverb": "ADV",
         }
-        return mapping.get(raw)
+        if raw in mapping:
+            return mapping[raw]
+        if raw.startswith("adj"):
+            return "ADJ"
+        if raw.startswith("adv"):
+            return "ADV"
+        if raw.startswith("verb"):
+            return "VERB"
+        if raw.startswith("subst") or "noun" in raw:
+            return "NOUN"
+        return None
 
     def lookup(self, lemma: str, pos: str) -> Optional[LexemeData]:
         return self._index.get((lemma.lower(), pos))
