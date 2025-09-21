@@ -32,6 +32,18 @@ except ImportError as exc:  # pragma: no cover - import guard
 
 LOGGER = logging.getLogger(__name__)
 ALLOWED_POS = {"NOUN", "VERB", "ADJ", "ADV"}
+EXCLUDED_ENTITY_TYPES = {
+    "PER",
+    "PERSON",
+    "LOC",
+    "GPE",
+    "ORG",
+    "FAC",
+    "MISC",
+    "EVENT",
+    "PRODUCT",
+    "WORK_OF_ART",
+}
 SEPARABLE_PREFIXES = {
     "ab",
     "an",
@@ -72,6 +84,7 @@ class PipelineConfig:
     mt_api_key: Optional[str] = None
     limit_books: Optional[int] = None
     force_model: Optional[str] = None
+    pending_frequency_threshold: int = 2
 
 
 @dataclass
@@ -1049,6 +1062,9 @@ def is_candidate(token) -> bool:
         return False
     if token.pos_ == "PROPN":
         return False
+    ent_type = token.ent_type_.strip()
+    if ent_type and ent_type.upper() in EXCLUDED_ENTITY_TYPES:
+        return False
     if token.lemma_ == "":
         return False
     if token.like_num:
@@ -1506,6 +1522,39 @@ def to_records(entries: List[TermEntry], book_label: str) -> List[Dict[str, obje
     return records
 
 
+
+
+def collect_pending_records(entries: List[TermEntry], book_label: str, threshold: int) -> List[Dict[str, object]]:
+    if threshold < 0:
+        threshold = 0
+    pending: List[Dict[str, object]] = []
+    for entry in entries:
+        if entry.translations:
+            continue
+        if entry.frequency <= threshold:
+            continue
+        plural_candidates = "; ".join(
+            f"{form} ({count})" for form, count in entry.plural_candidates.most_common()
+        )
+        pending.append(
+            {
+                "lemma": entry.lemma,
+                "surface": entry.surface,
+                "pos": entry.pos,
+                "frequency": entry.frequency,
+                "context_gender": entry.context_gender,
+                "context_number": entry.context_number,
+                "plural": entry.plural,
+                "plural_alternatives": "; ".join(entry.plural_alternatives),
+                "plural_candidates": plural_candidates,
+                "verb_forms": entry.verb_forms or "",
+                "example_sentence": entry.example_sentence,
+                "example_cloze": entry.example_cloze,
+                "book": book_label,
+            }
+        )
+    return pending
+
 def run_pipeline(config: PipelineConfig) -> None:
     config.output_dir.mkdir(parents=True, exist_ok=True)
     if not (config.wiktextract_path and config.wiktextract_path.exists()):
@@ -1539,11 +1588,25 @@ def run_pipeline(config: PipelineConfig) -> None:
         seen_global.update(seen)
         records = to_records(entries, book_path.stem)
         frame = pd.DataFrame(records)
-        output_name = f"{sanitize_book_name(book_path)}.csv"
-        output_path = config.output_dir / output_name
+        safe_name = sanitize_book_name(book_path)
+        output_path = config.output_dir / f"{safe_name}.csv"
         LOGGER.info("Writing %s entries to %s", len(frame), output_path)
         frame.sort_values(by=["pos", "lemma"], inplace=True)
         frame.to_csv(output_path, index=False, encoding="utf-8-sig")
+        pending_records = collect_pending_records(
+            entries, book_path.stem, config.pending_frequency_threshold
+        )
+        pending_path = config.output_dir / f"{safe_name}_pending.csv"
+        if pending_records:
+            pending_frame = pd.DataFrame(pending_records)
+            pending_frame.sort_values(by=["frequency", "lemma"], ascending=[False, True], inplace=True)
+            LOGGER.info("Writing %s pending entries to %s", len(pending_frame), pending_path)
+            pending_frame.to_csv(pending_path, index=False, encoding="utf-8-sig")
+        elif pending_path.exists():
+            LOGGER.info(
+                "Removing stale pending list at %s (no entries above threshold)", pending_path
+            )
+            pending_path.unlink()
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> PipelineConfig:
@@ -1597,6 +1660,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> PipelineConfig:
         help="Force a specific spaCy model name",
     )
     parser.add_argument(
+        "--pending-threshold",
+        type=int,
+        default=2,
+        help="Minimum frequency (exclusive) for exporting untranslated terms",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -1607,6 +1676,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> PipelineConfig:
         args.input_dir = Path("data/raw") / args.book_name
     if args.output_dir is None:
         args.output_dir = Path("data/processed") / args.book_name
+    if args.pending_threshold < 0:
+        parser.error("--pending-threshold must be non-negative")
     logging.basicConfig(
         level=getattr(logging, args.log_level), format="%(levelname)s %(message)s"
     )
@@ -1618,6 +1689,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> PipelineConfig:
         mt_api_key=args.mt_api_key,
         limit_books=args.limit_books,
         force_model=args.force_model,
+        pending_frequency_threshold=args.pending_threshold,
     )
 
 
