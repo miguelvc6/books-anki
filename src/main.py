@@ -75,8 +75,8 @@ class LexemeData:
     pos: str
     genders: List[str] = field(default_factory=list)
     plurals: List[str] = field(default_factory=list)
-    translations: List[str] = field(default_factory=list)
     translations_en: List[str] = field(default_factory=list)
+    definitions_de: List[str] = field(default_factory=list)
     verb_forms: Dict[str, str] = field(default_factory=dict)
 
 
@@ -115,6 +115,9 @@ class WiktextractLexicon:
             return out
 
         debug_targets = {("Hund", "NOUN"), ("gehen", "VERB"), ("aufstehen", "VERB")}
+        is_german_dump = bool(
+            self.path and self.path.name.lower().startswith(("de-", "dewiktionary"))
+        )
         with open_stream(self.path) as handle:
             for line in handle:
                 line = line.strip()
@@ -175,18 +178,9 @@ class WiktextractLexicon:
                         )
                         lang = str(lang_code).lower() if isinstance(lang_code, str) else None
                         target_list: List[str]
-                        if lang in {
-                            "es",
-                            "spa",
-                            "spanish",
-                            "espanol",
-                            "espa\u00f1ol",
-                        }:
-                            target_list = entry.translations
-                        elif lang in {"en", "eng", "english"}:
-                            target_list = entry.translations_en
-                        else:
+                        if lang not in {"en", "eng", "english"}:
                             continue
+                        target_list = entry.translations_en
                         word = translation.get("word")
                         if not word:
                             continue
@@ -204,26 +198,24 @@ class WiktextractLexicon:
                         formatted = formatted.strip()
                         if formatted and formatted not in target_list:
                             target_list.append(formatted)
-                    glosses = sense.get("glosses") or []
-                    for gloss in glosses:
-                        if not isinstance(gloss, str):
-                            continue
-                        g = re.sub(r"\s+", " ", gloss).strip()
-                        if not g:
-                            continue
-                        if g not in entry.translations_en:
-                            entry.translations_en.append(g)
-                entry.translations = _dedup_keep_order(entry.translations)
+                    if is_german_dump:
+                        for gloss in sense.get("glosses") or []:
+                            if not isinstance(gloss, str):
+                                continue
+                            g = re.sub(r"\s+", " ", gloss).strip()
+                            if not g:
+                                continue
+                            if g not in entry.definitions_de:
+                                entry.definitions_de.append(g)
                 entry.translations_en = _dedup_keep_order(entry.translations_en)
                 if (
                     LOGGER.isEnabledFor(logging.DEBUG)
                     and (entry.lemma, entry.pos) in debug_targets
                 ):
                     LOGGER.debug(
-                        "Lexeme %s/%s: ES=%d EN=%d",
+                        "Lexeme %s/%s: EN=%d",
                         entry.lemma,
                         entry.pos,
-                        len(entry.translations),
                         len(entry.translations_en),
                     )
         LOGGER.info("Loaded %s lexemes from wiktextract", len(self._index))
@@ -244,10 +236,10 @@ class WiktextractLexicon:
     def lookup(self, lemma: str, pos: str) -> Optional[LexemeData]:
         return self._index.get((lemma.lower(), pos))
 
-    def get_dictionary_glosses(self, lemma: str, pos: str, *, prefer_es: bool = True, max_n: int = 2) -> tuple[list[str], str | None]:
-        """
-        Devuelve (glosses, source), donde source es 'dictionary-es' o 'dictionary-en' o None si no hay.
-        """
+    def get_dictionary_glosses(
+        self, lemma: str, pos: str, *, max_n: int = 2
+    ) -> tuple[list[str], str | None]:
+        """Return (glosses, source) with English dictionary glosses if available."""
         lexeme = self.lookup(lemma, pos)
         if not lexeme:
             _, lexeme = self.resolve(lemma, pos)
@@ -272,15 +264,9 @@ class WiktextractLexicon:
                     break
             return result
 
-        order = (
-            ((lexeme.translations, "dictionary-es"), (lexeme.translations_en, "dictionary-en"))
-            if prefer_es
-            else ((lexeme.translations_en, "dictionary-en"), (lexeme.translations, "dictionary-es"))
-        )
-        for candidates, source in order:
-            cleaned = pick(candidates)
-            if cleaned:
-                return cleaned, source
+        cleaned = pick(getattr(lexeme, 'translations_en', None))
+        if cleaned:
+            return cleaned, "dictionary-en"
         return [], None
 
 
@@ -346,7 +332,7 @@ class WiktextractLexicon:
                 score += 4
         if pos == "VERB" and lexeme.verb_forms:
             score += 3
-        if lexeme.translations or lexeme.translations_en:
+        if lexeme.translations_en:
             score += 2
         if lexeme.lemma:
             score += max(0, 3 - lexeme.lemma.count(" "))
@@ -460,21 +446,19 @@ class WiktextractLexicon:
                 continue
             return base, lexeme
         return None
+
+
 class LibreTranslateClient:
     def __init__(self, url: Optional[str], api_key: Optional[str] = None) -> None:
         self.url = url.rstrip("/") if url else None
         self.api_key = api_key
-        self.cache: Dict[str, List[str]] = {}
-        if not self.url:
-            LOGGER.info("MT fallback disabled (no LibreTranslate URL provided)")
 
-    def translate(self, text: str) -> Optional[List[str]]:
+    def translate(
+        self, text: str, source: str = "de", target: str = "en"
+    ) -> Optional[List[str]]:
         if not self.url:
             return None
-        cached = self.cache.get(text)
-        if cached is not None:
-            return cached
-        payload = {"q": text, "source": "de", "target": "es", "format": "text"}
+        payload = {"q": text, "source": source, "target": target, "format": "text"}
         if self.api_key:
             payload["api_key"] = self.api_key
         try:
@@ -491,7 +475,6 @@ class LibreTranslateClient:
                 for variant in re.split(r"[,;/]", translation)
                 if variant.strip()
             ]
-            self.cache[text] = variants
             return variants
         return None
 
@@ -514,6 +497,65 @@ class TermEntry:
     context_gender: Optional[str] = None
     context_number: Optional[str] = None
     plural_candidates: Counter[str] = field(default_factory=Counter)
+
+
+class MultiSourceTranslator:
+    def __init__(
+        self,
+        lexicon: WiktextractLexicon,
+        mt_client: Optional[LibreTranslateClient] = None,
+        *,
+        max_variants: int = 2,
+    ) -> None:
+        self.lexicon = lexicon
+        self.mt = mt_client
+        self.max_variants = max_variants
+
+    def translate_entry(self, entry: TermEntry) -> None:
+        glosses_en, source = self.lexicon.get_dictionary_glosses(
+            entry.lemma,
+            entry.pos,
+            max_n=self.max_variants,
+        )
+        if glosses_en:
+            entry.translations = glosses_en[: self.max_variants]
+            entry.translation_source = source or "dictionary-en"
+            return
+
+        if self.mt:
+            lemma_translations = self._mt_text(entry.lemma, source="de", target="en")
+            if lemma_translations:
+                entry.translations = lemma_translations[: self.max_variants]
+                entry.translation_source = "mt-de-en"
+                return
+
+        entry.translations = []
+        entry.translation_source = None
+
+    def _mt_text(self, text: str, *, source: str, target: str) -> Optional[List[str]]:
+        if not self.mt:
+            return None
+        result = self.mt.translate(text, source=source, target=target)
+        if not result:
+            return None
+        cleaned: List[str] = []
+        seen: Set[str] = set()
+        for item in result:
+            if not isinstance(item, str):
+                continue
+            trimmed = item.strip()
+            if not trimmed:
+                continue
+            key = trimmed.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(trimmed)
+            if len(cleaned) >= self.max_variants:
+                break
+        return cleaned or None
+
+
 
 
 def normalize_text(raw_text: str) -> str:
@@ -837,7 +879,7 @@ def process_book(
     path: Path,
     nlp: Language,
     lexicon: WiktextractLexicon,
-    mt_client: LibreTranslateClient,
+    translator: MultiSourceTranslator,
     seen_global: Set[str],
 ) -> Tuple[List[TermEntry], Set[str]]:
     LOGGER.info("Processing book %s", path.name)
@@ -925,35 +967,33 @@ def process_book(
         if entry.pos == "NOUN" and not entry.gender and entry.context_gender:
             entry.gender = entry.context_gender
 
-        glosses, source = lexicon.get_dictionary_glosses(entry.lemma, entry.pos, prefer_es=True, max_n=2)
-        if glosses:
-            entry.translations = glosses
-            entry.translation_source = source
-        else:
-            entry.translations = []
-            entry.translation_source = None
+        translator.translate_entry(entry)
 
     total_entries = len(entry_list)
-    dict_es = sum(1 for entry in entry_list if entry.translation_source == "dictionary-es")
     dict_en = sum(1 for entry in entry_list if entry.translation_source == "dictionary-en")
-    dict_none = max(total_entries - dict_es - dict_en, 0)
+    mt_de_en = sum(1 for entry in entry_list if entry.translation_source == "mt-de-en")
+    dict_none = max(total_entries - (dict_en + mt_de_en), 0)
     if total_entries:
-        pct_es = dict_es / total_entries * 100
         pct_en = dict_en / total_entries * 100
+        pct_mt = mt_de_en / total_entries * 100
         pct_none = dict_none / total_entries * 100
     else:
-        pct_es = pct_en = pct_none = 0.0
+        pct_en = pct_mt = pct_none = 0.0
     LOGGER.info(
-        "Dictionary coverage for %s: %.1f%% ES, %.1f%% EN, %.1f%% none",
+        "Coverage %s: EN %.1f%% | MT(DE\u2192EN) %.1f%% | none %.1f%%",
         path.name,
-        pct_es,
         pct_en,
+        pct_mt,
         pct_none,
     )
     if LOGGER.isEnabledFor(logging.DEBUG):
-        examples = [e for e in entry_list if e.translation_source == "dictionary-en"][:5]
+        examples = [
+            e
+            for e in entry_list
+            if e.translation_source in {"dictionary-en", "mt-de-en"}
+        ][:5]
         for ex in examples:
-            LOGGER.debug("Example EN gloss: %s [%s] -> %s", ex.lemma, ex.pos, ex.translations)
+            LOGGER.debug("Example translation: %s [%s] -> %s (%s)", ex.lemma, ex.pos, ex.translations, ex.translation_source)
 
     seen_keys = {entry.lemma.lower() for entry in entry_list}
     return entry_list, seen_keys
@@ -1007,6 +1047,13 @@ def run_pipeline(config: PipelineConfig) -> None:
     mt_client = LibreTranslateClient(
         config.mt_url or MT_DEFAULT_URL, config.mt_api_key or MT_API_KEY
     )
+    translator = MultiSourceTranslator(
+        lexicon,
+        mt_client if getattr(mt_client, "url", None) else None,
+        max_variants=2,
+    )
+    if not translator.mt:
+        LOGGER.info("Machine translation disabled (no URL); using dictionary glosses only.")
     book_paths = sorted(config.input_dir.glob("*.txt"))
     if config.limit_books is not None:
         book_paths = book_paths[: config.limit_books]
@@ -1014,7 +1061,7 @@ def run_pipeline(config: PipelineConfig) -> None:
         raise SystemExit(f"No .txt files found in {config.input_dir}")
     seen_global: Set[str] = set()
     for idx, book_path in enumerate(book_paths, start=1):
-        entries, seen = process_book(book_path, nlp, lexicon, mt_client, seen_global)
+        entries, seen = process_book(book_path, nlp, lexicon, translator, seen_global)
         seen_global.update(seen)
         records = to_records(entries, book_path.stem)
         frame = pd.DataFrame(records)
