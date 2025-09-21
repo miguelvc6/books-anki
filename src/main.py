@@ -73,6 +73,10 @@ POS_PRIORITY = {
 ARTICLE_PATTERN = re.compile(
     r"^(?:der|die|das|den|dem|des|ein|eine|einen|einem|eines)\s+", re.IGNORECASE
 )
+PARENTHETICAL_CHUNK_PATTERN = re.compile(r"\([^()]*\)")
+SEMICOLON_NORMALIZER = re.compile(r"\s*;\s*")
+EXTRA_WHITESPACE_PATTERN = re.compile(r"\s{2,}")
+VERB_TRANSLATION_PREFIX_RE = re.compile(r"(?i)^to\b")
 MT_DEFAULT_URL = os.environ.get("LIBRETRANSLATE_URL")
 MT_API_KEY = os.environ.get("LIBRETRANSLATE_API_KEY")
 DEFAULT_WIKTEXTRACT_PATH = (
@@ -1372,10 +1376,25 @@ def format_front(entry: TermEntry, *, annotate_pos: bool = False) -> str:
     return base
 
 
+def _prefix_verb_translation(translation: str) -> str:
+    trimmed = translation.lstrip()
+    if not trimmed or VERB_TRANSLATION_PREFIX_RE.match(trimmed):
+        return translation
+    leading = translation[: len(translation) - len(trimmed)]
+    return f"{leading}to {trimmed}"
+
+
+def format_translations(entry: TermEntry, *, limit: Optional[int] = None) -> str:
+    if not entry.translations:
+        return ""
+    items = list(entry.translations[:limit] if limit is not None else entry.translations)
+    if entry.pos == "VERB":
+        items = [_prefix_verb_translation(item) for item in items]
+    return "; ".join(items)
+
+
 def format_back(entry: TermEntry) -> str:
-    if entry.translations:
-        return "; ".join(entry.translations[:2])
-    return ""
+    return format_translations(entry, limit=2)
 
 
 def sanitize_book_name(path: Path) -> str:
@@ -1576,7 +1595,7 @@ def to_records(entries: List[TermEntry], book_label: str) -> List[Dict[str, obje
                 "plural": entry.plural,
                 "plural_display": entry.plural_display,
                 "plural_alternatives": "; ".join(entry.plural_alternatives),
-                "translations": "; ".join(entry.translations),
+                "translations": format_translations(entry),
                 "translation_source": entry.translation_source,
                 "example": entry.example_sentence,
                 "example_cloze": entry.example_cloze,
@@ -1621,6 +1640,21 @@ def collect_pending_records(
     return pending
 
 
+def strip_parenthetical_text(value: str):
+    """Remove parenthetical glosses (including nested) and normalize spacing."""
+    if not isinstance(value, str):
+        return value
+    cleaned = value
+    while True:
+        updated = PARENTHETICAL_CHUNK_PATTERN.sub("", cleaned)
+        if updated == cleaned:
+            break
+        cleaned = updated
+    cleaned = SEMICOLON_NORMALIZER.sub("; ", cleaned)
+    cleaned = EXTRA_WHITESPACE_PATTERN.sub(" ", cleaned)
+    return cleaned.strip(" ;")
+
+
 def run_pipeline(config: PipelineConfig) -> None:
     config.output_dir.mkdir(parents=True, exist_ok=True)
     if not (config.wiktextract_path and config.wiktextract_path.exists()):
@@ -1662,9 +1696,7 @@ def run_pipeline(config: PipelineConfig) -> None:
         output_path = config.output_dir / f"{safe_name}.csv"
         LOGGER.info("Writing %s entries to %s", len(frame), output_path)
         frame.sort_values(by=["pos", "lemma"], inplace=True)
-        frame["back"] = (
-            frame["back"].str.replace(r"\s*\([^)]*\)", "", regex=True).str.strip()
-        )
+        frame["back"] = frame["back"].map(strip_parenthetical_text)
         frame.to_csv(output_path, index=False, encoding="utf-8-sig")
         pending_records = collect_pending_records(
             entries, book_path.stem, config.pending_frequency_threshold
