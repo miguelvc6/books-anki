@@ -1,4 +1,5 @@
 """Command-line pipeline to extract German vocabulary from Harry Potter books and build Anki decks."""
+
 from __future__ import annotations
 
 import argparse
@@ -69,10 +70,16 @@ POS_PRIORITY = {
     "ADJ": 2,
     "ADV": 1,
 }
-ARTICLE_PATTERN = re.compile(r"^(?:der|die|das|den|dem|des|ein|eine|einen|einem|eines)\s+", re.IGNORECASE)
+ARTICLE_PATTERN = re.compile(
+    r"^(?:der|die|das|den|dem|des|ein|eine|einen|einem|eines)\s+", re.IGNORECASE
+)
 MT_DEFAULT_URL = os.environ.get("LIBRETRANSLATE_URL")
 MT_API_KEY = os.environ.get("LIBRETRANSLATE_API_KEY")
-DEFAULT_WIKTEXTRACT_PATH = Path("data/de-extract.jsonl.gz") if Path("data/de-extract.jsonl.gz").exists() else None
+DEFAULT_WIKTEXTRACT_PATH = (
+    Path("data/de-extract.jsonl.gz")
+    if Path("data/de-extract.jsonl.gz").exists()
+    else None
+)
 
 
 @dataclass
@@ -102,7 +109,9 @@ class WiktextractLexicon:
     def __init__(self, path: Optional[Path]) -> None:
         self.path = path
         self._index: Dict[Tuple[str, str], LexemeData] = {}
-        self._form_index: Dict[Tuple[str, str], List[Tuple[str, str]]] = defaultdict(list)
+        self._form_index: Dict[Tuple[str, str], List[Tuple[str, str]]] = defaultdict(
+            list
+        )
         if self.path and self.path.exists():
             self._build_index()
         else:
@@ -117,7 +126,9 @@ class WiktextractLexicon:
 
             def open_stream(file_path: Path):
                 return gzip.open(file_path, "rt", encoding="utf-8")
+
         else:
+
             def open_stream(file_path: Path):
                 return open(file_path, "rt", encoding="utf-8")
 
@@ -160,7 +171,11 @@ class WiktextractLexicon:
                 if genders and not entry.genders:
                     entry.genders = [g for g in genders if g]
                 if not entry.genders:
-                    tag_genders = [t for t in (blob.get("tags") or []) if t in {"masculine", "feminine", "neuter", "common"}]
+                    tag_genders = [
+                        t
+                        for t in (blob.get("tags") or [])
+                        if t in {"masculine", "feminine", "neuter", "common"}
+                    ]
                     if tag_genders:
                         entry.genders = tag_genders
                 for form in blob.get("forms", []) or []:
@@ -187,13 +202,16 @@ class WiktextractLexicon:
                     ):
                         if tag in tags and tag not in entry.verb_forms:
                             entry.verb_forms[tag] = form_text
+
                 def _append_translation(data_obj: dict) -> None:
                     lang_code = (
                         data_obj.get("lang_code")
                         or data_obj.get("language_code")
                         or data_obj.get("lang")
                     )
-                    lang = str(lang_code).lower() if isinstance(lang_code, str) else None
+                    lang = (
+                        str(lang_code).lower() if isinstance(lang_code, str) else None
+                    )
                     if lang not in {"en", "eng", "english"}:
                         return
                     word = data_obj.get("word")
@@ -206,7 +224,9 @@ class WiktextractLexicon:
                             note_bits.append(value)
                         elif isinstance(value, Sequence):
                             note_bits.extend(str(x) for x in value)
-                    formatted = f"{word} ({'; '.join(note_bits)})" if note_bits else word
+                    formatted = (
+                        f"{word} ({'; '.join(note_bits)})" if note_bits else word
+                    )
                     formatted = formatted.strip()
                     if formatted:
                         entry.translations_en.append(formatted)
@@ -295,11 +315,10 @@ class WiktextractLexicon:
                     break
             return result
 
-        cleaned = pick(getattr(lexeme, 'translations_en', None))
+        cleaned = pick(getattr(lexeme, "translations_en", None))
         if cleaned:
             return cleaned, "dictionary-en"
         return [], None
-
 
     def resolve(
         self, lemma: str, pos: str, surface: Optional[str] = None
@@ -369,7 +388,9 @@ class WiktextractLexicon:
             score += max(0, 3 - lexeme.lemma.count(" "))
         return score
 
-    def _prefer_lexeme(self, candidate: LexemeData, current: LexemeData, pos: str) -> bool:
+    def _prefer_lexeme(
+        self, candidate: LexemeData, current: LexemeData, pos: str
+    ) -> bool:
         if candidate is current:
             return False
         cand_score = self._lexeme_score(candidate, pos)
@@ -433,7 +454,9 @@ class WiktextractLexicon:
             variants.append(stem + "en")
         return variants
 
-    def _iter_infinitive_candidates(self, lemma: str, surface: Optional[str]) -> Iterable[str]:
+    def _iter_infinitive_candidates(
+        self, lemma: str, surface: Optional[str]
+    ) -> Iterable[str]:
         seen: Set[str] = set()
         sources: List[str] = [lemma]
         if surface:
@@ -441,7 +464,9 @@ class WiktextractLexicon:
         for raw in sources:
             for base in self._base_variants(raw):
                 for candidate in self._expand_verb_forms(base):
-                    cleaned = re.sub(r"[^a-zA-Z\u00e4\u00f6\u00fc\u00df]", "", candidate)
+                    cleaned = re.sub(
+                        r"[^a-zA-Z\u00e4\u00f6\u00fc\u00df]", "", candidate
+                    )
                     if len(cleaned) < 3:
                         continue
                     if cleaned not in seen:
@@ -528,7 +553,6 @@ class TermEntry:
     context_gender: Optional[str] = None
     context_number: Optional[str] = None
     plural_candidates: Counter[str] = field(default_factory=Counter)
-
 
 
 class MultiSourceTranslator:
@@ -684,7 +708,9 @@ class MultiSourceTranslator:
                     return translations[: self.max_variants], source
         return None
 
-    def _heuristic_present_participle(self, entry: TermEntry) -> Optional[Tuple[List[str], str]]:
+    def _heuristic_present_participle(
+        self, entry: TermEntry
+    ) -> Optional[Tuple[List[str], str]]:
         if entry.pos != "ADJ":
             return None
         forms = self._present_participle_forms(entry.lemma)
@@ -692,7 +718,9 @@ class MultiSourceTranslator:
             return forms, "heuristic-participle"
         return None
 
-    def _heuristic_past_participle(self, entry: TermEntry) -> Optional[Tuple[List[str], str]]:
+    def _heuristic_past_participle(
+        self, entry: TermEntry
+    ) -> Optional[Tuple[List[str], str]]:
         if entry.pos != "ADJ":
             return None
         forms = self._past_participle_forms(entry.lemma)
@@ -700,7 +728,9 @@ class MultiSourceTranslator:
             return forms, "heuristic-pastpart"
         return None
 
-    def _heuristic_suffix_compound(self, entry: TermEntry) -> Optional[Tuple[List[str], str]]:
+    def _heuristic_suffix_compound(
+        self, entry: TermEntry
+    ) -> Optional[Tuple[List[str], str]]:
         if entry.pos != "ADJ":
             return None
         normalized = self._strip_adjective_inflection(entry.lemma.lower())
@@ -717,12 +747,16 @@ class MultiSourceTranslator:
                     variant, allow_present=True, allow_past=True
                 )
                 if base_translation:
-                    combined = self._combine_suffix_translation(base_translation, suffix)
+                    combined = self._combine_suffix_translation(
+                        base_translation, suffix
+                    )
                     if combined:
                         return [combined], f"heuristic-compound-{suffix}"
         return None
 
-    def _heuristic_split_compound(self, entry: TermEntry) -> Optional[Tuple[List[str], str]]:
+    def _heuristic_split_compound(
+        self, entry: TermEntry
+    ) -> Optional[Tuple[List[str], str]]:
         if entry.pos != "ADJ":
             return None
         normalized = self._strip_adjective_inflection(entry.lemma.lower())
@@ -870,13 +904,18 @@ class MultiSourceTranslator:
     def _stem_variants(self, stem: str) -> List[str]:
         variants = {stem}
         for ending in ("s", "es", "en", "n", "er"):
-            if stem.endswith(ending) and len(stem) - len(ending) >= self._SPLIT_MIN_LEFT:
+            if (
+                stem.endswith(ending)
+                and len(stem) - len(ending) >= self._SPLIT_MIN_LEFT
+            ):
                 variants.add(stem[: -len(ending)])
         if stem and not stem.endswith("e"):
             variants.add(f"{stem}e")
         return [variant for variant in variants if len(variant) >= self._SPLIT_MIN_LEFT]
 
-    def _combine_suffix_translation(self, base_translation: str, suffix: str) -> Optional[str]:
+    def _combine_suffix_translation(
+        self, base_translation: str, suffix: str
+    ) -> Optional[str]:
         base = base_translation.strip().lower()
         if not base:
             return None
@@ -939,7 +978,10 @@ class MultiSourceTranslator:
             return f"{word[:-2]}ying"
         if word.endswith("e") and not word.endswith(("ee", "oe", "ye")):
             return f"{word[:-1]}ing"
-        if re.search(r"[aeiou][bcdfghjklmnpqrstvwxyz]$", word) and word[-1] not in "wxy":
+        if (
+            re.search(r"[aeiou][bcdfghjklmnpqrstvwxyz]$", word)
+            and word[-1] not in "wxy"
+        ):
             return f"{word}{word[-1]}ing"
         return f"{word}ing"
 
@@ -958,11 +1000,12 @@ class MultiSourceTranslator:
             if word.endswith(("ee", "oe", "ye")):
                 return f"{word}d"
             return f"{word[:-1]}ed"
-        if re.search(r"[aeiou][bcdfghjklmnpqrstvwxyz]$", word) and word[-1] not in "wxy":
+        if (
+            re.search(r"[aeiou][bcdfghjklmnpqrstvwxyz]$", word)
+            and word[-1] not in "wxy"
+        ):
             return f"{word}{word[-1]}ed"
         return f"{word}ed"
-
-
 
 
 def normalize_text(raw_text: str) -> str:
@@ -1039,7 +1082,7 @@ def fallback_simplemma_infinitive(lemma: str, surface: str) -> Optional[str]:
     for source in (surface, lemma):
         if not source:
             continue
-        guess = simplemma.lemmatize(source, 'de', greedy=True)
+        guess = simplemma.lemmatize(source, "de", greedy=True)
         if not guess:
             continue
         normalized = guess.strip()
@@ -1050,7 +1093,7 @@ def fallback_simplemma_infinitive(lemma: str, surface: str) -> Optional[str]:
         if normalized not in candidates:
             candidates.append(normalized)
     for candidate in candidates:
-        if candidate.endswith('n') or candidate in {'sein', 'tun'}:
+        if candidate.endswith("n") or candidate in {"sein", "tun"}:
             return candidate
     return None
 
@@ -1070,21 +1113,26 @@ def is_candidate(token) -> bool:
     if token.like_num:
         return False
     text = token.text.strip()
-    dash_chars = ('-', chr(0x2013), chr(0x2014))
+    dash_chars = ("-", chr(0x2013), chr(0x2014))
     if text.startswith(dash_chars):
         return False
-    stripped = text.strip(''.join(dash_chars))
+    stripped = text.strip("".join(dash_chars))
     if any(char.isdigit() for char in text):
         return False
     if text.isupper() and len(text) > 1:
         return False
-    if '-' in text:
-        first_segment, _, rest_segment = text.partition('-')
-        if len(first_segment) == 1 and rest_segment and rest_segment[0].isalpha() and first_segment.lower() == rest_segment[0].lower():
+    if "-" in text:
+        first_segment, _, rest_segment = text.partition("-")
+        if (
+            len(first_segment) == 1
+            and rest_segment
+            and rest_segment[0].isalpha()
+            and first_segment.lower() == rest_segment[0].lower()
+        ):
             return False
     if len(stripped) <= 4 and len({ch.lower() for ch in stripped if ch.isalpha()}) <= 2:
         return False
-    if re.search(r'[A-Za-zÄÖÜäöüß]-[A-Za-zÄÖÜäöüß]-', text):
+    if re.search(r"[A-Za-zÄÖÜäöüß]-[A-Za-zÄÖÜäöüß]-", text):
         return False
     if not stripped or not any(char.isalpha() for char in stripped):
         return False
@@ -1093,7 +1141,6 @@ def is_candidate(token) -> bool:
     if token.pos_ == "ADV" and token.is_stop:
         return True
     return True
-
 
 
 def normalize_gender_tag(raw: Optional[str]) -> Optional[str]:
@@ -1334,7 +1381,7 @@ def format_back(entry: TermEntry) -> str:
 def sanitize_book_name(path: Path) -> str:
     stem = path.stem.lower()
     normalized = unicodedata.normalize("NFKD", stem)
-    ascii_friendly = ''.join(ch for ch in normalized if not unicodedata.combining(ch))
+    ascii_friendly = "".join(ch for ch in normalized if not unicodedata.combining(ch))
     base = re.sub(r"[^a-z0-9]+", "_", ascii_friendly)
     return base.strip("_")
 
@@ -1361,7 +1408,9 @@ def process_book(
                 )
                 pos = token.pos_
                 lemma_candidate = raw_lemma.strip()
-                lemma_candidate, lexeme = lexicon.resolve(lemma_candidate, pos, token.text)
+                lemma_candidate, lexeme = lexicon.resolve(
+                    lemma_candidate, pos, token.text
+                )
                 resolved_pos = lexeme.pos if lexeme else pos
                 if pos == "VERB":
                     needs_infinitive = (
@@ -1370,12 +1419,16 @@ def process_book(
                         or not lexeme.verb_forms.get("infinitive")
                     )
                     if needs_infinitive:
-                        suggestion = lexicon.suggest_verb_infinitive(lemma_candidate, token.text)
+                        suggestion = lexicon.suggest_verb_infinitive(
+                            lemma_candidate, token.text
+                        )
                         if suggestion:
                             lemma_candidate, lexeme = suggestion
                             resolved_pos = "VERB"
                         else:
-                            fallback = fallback_simplemma_infinitive(lemma_candidate, token.text)
+                            fallback = fallback_simplemma_infinitive(
+                                lemma_candidate, token.text
+                            )
                             if fallback:
                                 lemma_candidate = fallback
                                 resolved_pos = "VERB"
@@ -1416,7 +1469,9 @@ def process_book(
                     plural, alternatives = select_plural(lexeme.plurals, entry.lemma)
                     entry.plural = plural
                     entry.plural_alternatives = alternatives
-                    entry.plural_display = derive_plural_display(entry.lemma, entry.plural)
+                    entry.plural_display = derive_plural_display(
+                        entry.lemma, entry.plural
+                    )
             if entry.pos == "VERB" and lexeme.verb_forms:
                 parts = []
                 for tag in (
@@ -1440,7 +1495,9 @@ def process_book(
             if ordered:
                 entry.plural = ordered[0]
                 entry.plural_display = derive_plural_display(entry.lemma, entry.plural)
-                entry.plural_alternatives = [alt for alt in ordered[1:] if alt != entry.plural]
+                entry.plural_alternatives = [
+                    alt for alt in ordered[1:] if alt != entry.plural
+                ]
 
         if entry.pos == "NOUN" and not entry.gender and entry.context_gender:
             entry.gender = entry.context_gender
@@ -1452,7 +1509,9 @@ def process_book(
         entry_list = filtered_entries
 
     total_entries = len(entry_list)
-    dict_en = sum(1 for entry in entry_list if entry.translation_source == "dictionary-en")
+    dict_en = sum(
+        1 for entry in entry_list if entry.translation_source == "dictionary-en"
+    )
     heuristic = sum(
         1
         for entry in entry_list
@@ -1483,7 +1542,13 @@ def process_book(
             or (e.translation_source or "").startswith("heuristic-")
         ][:5]
         for ex in examples:
-            LOGGER.debug("Example translation: %s [%s] -> %s (%s)", ex.lemma, ex.pos, ex.translations, ex.translation_source)
+            LOGGER.debug(
+                "Example translation: %s [%s] -> %s (%s)",
+                ex.lemma,
+                ex.pos,
+                ex.translations,
+                ex.translation_source,
+            )
 
     seen_keys = {entry.lemma.lower() for entry in entry_list}
     return entry_list, seen_keys
@@ -1522,9 +1587,9 @@ def to_records(entries: List[TermEntry], book_label: str) -> List[Dict[str, obje
     return records
 
 
-
-
-def collect_pending_records(entries: List[TermEntry], book_label: str, threshold: int) -> List[Dict[str, object]]:
+def collect_pending_records(
+    entries: List[TermEntry], book_label: str, threshold: int
+) -> List[Dict[str, object]]:
     if threshold < 0:
         threshold = 0
     pending: List[Dict[str, object]] = []
@@ -1555,6 +1620,7 @@ def collect_pending_records(entries: List[TermEntry], book_label: str, threshold
         )
     return pending
 
+
 def run_pipeline(config: PipelineConfig) -> None:
     config.output_dir.mkdir(parents=True, exist_ok=True)
     if not (config.wiktextract_path and config.wiktextract_path.exists()):
@@ -1564,7 +1630,9 @@ def run_pipeline(config: PipelineConfig) -> None:
                 config.wiktextract_path,
             )
         else:
-            LOGGER.warning("Wiktextract dataset not configured; dictionary glosses will be unavailable.")
+            LOGGER.warning(
+                "Wiktextract dataset not configured; dictionary glosses will be unavailable."
+            )
     nlp = load_model(config.force_model)
     lexicon = WiktextractLexicon(config.wiktextract_path)
     mt_client = LibreTranslateClient(
@@ -1576,7 +1644,9 @@ def run_pipeline(config: PipelineConfig) -> None:
         max_variants=2,
     )
     if not translator.mt:
-        LOGGER.info("Machine translation disabled (no URL); using dictionary glosses only.")
+        LOGGER.info(
+            "Machine translation disabled (no URL); using dictionary glosses only."
+        )
     book_paths = sorted(config.input_dir.glob("*.txt"))
     if config.limit_books is not None:
         book_paths = book_paths[: config.limit_books]
@@ -1592,6 +1662,9 @@ def run_pipeline(config: PipelineConfig) -> None:
         output_path = config.output_dir / f"{safe_name}.csv"
         LOGGER.info("Writing %s entries to %s", len(frame), output_path)
         frame.sort_values(by=["pos", "lemma"], inplace=True)
+        frame["back"] = (
+            frame["back"].str.replace(r"\s*\([^)]*\)", "", regex=True).str.strip()
+        )
         frame.to_csv(output_path, index=False, encoding="utf-8-sig")
         pending_records = collect_pending_records(
             entries, book_path.stem, config.pending_frequency_threshold
@@ -1599,12 +1672,17 @@ def run_pipeline(config: PipelineConfig) -> None:
         pending_path = config.output_dir / f"{safe_name}_pending.csv"
         if pending_records:
             pending_frame = pd.DataFrame(pending_records)
-            pending_frame.sort_values(by=["frequency", "lemma"], ascending=[False, True], inplace=True)
-            LOGGER.info("Writing %s pending entries to %s", len(pending_frame), pending_path)
+            pending_frame.sort_values(
+                by=["frequency", "lemma"], ascending=[False, True], inplace=True
+            )
+            LOGGER.info(
+                "Writing %s pending entries to %s", len(pending_frame), pending_path
+            )
             pending_frame.to_csv(pending_path, index=False, encoding="utf-8-sig")
         elif pending_path.exists():
             LOGGER.info(
-                "Removing stale pending list at %s (no entries above threshold)", pending_path
+                "Removing stale pending list at %s (no entries above threshold)",
+                pending_path,
             )
             pending_path.unlink()
 
