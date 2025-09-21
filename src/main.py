@@ -15,6 +15,11 @@ from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 import ftfy
 import pandas as pd
 import requests
+
+try:
+    import simplemma
+except ImportError:
+    simplemma = None
 from wordfreq import zipf_frequency
 
 try:
@@ -638,6 +643,29 @@ def infer_particle_from_context(token) -> Optional[str]:
     return None
 
 
+def fallback_simplemma_infinitive(lemma: str, surface: str) -> Optional[str]:
+    if simplemma is None:
+        return None
+    candidates: List[str] = []
+    for source in (surface, lemma):
+        if not source:
+            continue
+        guess = simplemma.lemmatize(source, 'de', greedy=True)
+        if not guess:
+            continue
+        normalized = guess.strip()
+        if not normalized:
+            continue
+        if normalized.lower() == lemma.lower():
+            continue
+        if normalized not in candidates:
+            candidates.append(normalized)
+    for candidate in candidates:
+        if candidate.endswith('n') or candidate in {'sein', 'tun'}:
+            return candidate
+    return None
+
+
 def is_candidate(token) -> bool:
     if token.is_space or not token.text.strip():
         return False
@@ -912,11 +940,25 @@ def process_book(
                 lemma_candidate = raw_lemma.strip()
                 lemma_candidate, lexeme = lexicon.resolve(lemma_candidate, pos, token.text)
                 resolved_pos = lexeme.pos if lexeme else pos
-                if resolved_pos != "VERB" or not lexeme or not lexeme.verb_forms.get("infinitive"):
-                    suggestion = lexicon.suggest_verb_infinitive(lemma_candidate, token.text)
-                    if suggestion:
-                        lemma_candidate, lexeme = suggestion
-                        resolved_pos = "VERB"
+                if pos == "VERB":
+                    needs_infinitive = (
+                        resolved_pos != "VERB"
+                        or not lexeme
+                        or not lexeme.verb_forms.get("infinitive")
+                    )
+                    if needs_infinitive:
+                        suggestion = lexicon.suggest_verb_infinitive(lemma_candidate, token.text)
+                        if suggestion:
+                            lemma_candidate, lexeme = suggestion
+                            resolved_pos = "VERB"
+                        else:
+                            fallback = fallback_simplemma_infinitive(lemma_candidate, token.text)
+                            if fallback:
+                                lemma_candidate = fallback
+                                resolved_pos = "VERB"
+                                lemma_candidate, lexeme = lexicon.resolve(
+                                    lemma_candidate, resolved_pos, token.text
+                                )
                 lemma = canonicalize_lemma_casing(lemma_candidate, resolved_pos)
                 lemma_key = lemma.lower()
                 if lemma_key in seen_global:
