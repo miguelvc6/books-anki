@@ -517,7 +517,81 @@ class TermEntry:
     plural_candidates: Counter[str] = field(default_factory=Counter)
 
 
+
 class MultiSourceTranslator:
+    _ADJ_INFLECTION_ENDINGS = (
+        "sten",
+        "stem",
+        "ster",
+        "stes",
+        "ste",
+        "st",
+        "en",
+        "em",
+        "er",
+        "es",
+        "e",
+    )
+    _SUFFIX_RULES = {
+        "f\u00f6rmig": ("shaped", "hyphen"),
+        "artig": ("like", "hyphen"),
+        "bar": ("able", "suffix"),
+        "haft": ("al", "hyphen"),
+        "los": ("less", "suffix"),
+        "ig": ("y", "suffix"),
+    }
+    _IRREGULAR_PARTICIPLES = {
+        "be": "been",
+        "become": "become",
+        "begin": "begun",
+        "break": "broken",
+        "bring": "brought",
+        "buy": "bought",
+        "come": "come",
+        "do": "done",
+        "drink": "drunk",
+        "drive": "driven",
+        "eat": "eaten",
+        "fall": "fallen",
+        "find": "found",
+        "fly": "flown",
+        "forget": "forgotten",
+        "get": "gotten",
+        "give": "given",
+        "go": "gone",
+        "grow": "grown",
+        "have": "had",
+        "hear": "heard",
+        "hide": "hidden",
+        "know": "known",
+        "lay": "laid",
+        "lead": "led",
+        "leave": "left",
+        "lose": "lost",
+        "make": "made",
+        "meet": "met",
+        "pay": "paid",
+        "read": "read",
+        "ride": "ridden",
+        "run": "run",
+        "say": "said",
+        "see": "seen",
+        "sell": "sold",
+        "send": "sent",
+        "sit": "sat",
+        "speak": "spoken",
+        "stand": "stood",
+        "take": "taken",
+        "teach": "taught",
+        "think": "thought",
+        "throw": "thrown",
+        "wear": "worn",
+        "win": "won",
+        "write": "written",
+    }
+    _SPLIT_MIN_LEFT = 3
+    _SPLIT_MIN_RIGHT = 3
+
     def __init__(
         self,
         lexicon: WiktextractLexicon,
@@ -539,6 +613,14 @@ class MultiSourceTranslator:
             entry.translations = glosses_en[: self.max_variants]
             entry.translation_source = source or "dictionary-en"
             return
+
+        heuristic = self._apply_heuristics(entry)
+        if heuristic:
+            translations, heuristic_source = heuristic
+            if translations:
+                entry.translations = translations[: self.max_variants]
+                entry.translation_source = heuristic_source
+                return
 
         if self.mt:
             lemma_translations = self._mt_text(entry.lemma, source="de", target="en")
@@ -572,6 +654,300 @@ class MultiSourceTranslator:
             if len(cleaned) >= self.max_variants:
                 break
         return cleaned or None
+
+    def _apply_heuristics(self, entry: TermEntry) -> Optional[Tuple[List[str], str]]:
+        handlers = (
+            self._heuristic_present_participle,
+            self._heuristic_past_participle,
+            self._heuristic_suffix_compound,
+            self._heuristic_split_compound,
+        )
+        for handler in handlers:
+            result = handler(entry)
+            if result:
+                translations, source = result
+                translations = [t for t in translations if t]
+                if translations:
+                    return translations[: self.max_variants], source
+        return None
+
+    def _heuristic_present_participle(self, entry: TermEntry) -> Optional[Tuple[List[str], str]]:
+        if entry.pos != "ADJ":
+            return None
+        forms = self._present_participle_forms(entry.lemma)
+        if forms:
+            return forms, "heuristic-participle"
+        return None
+
+    def _heuristic_past_participle(self, entry: TermEntry) -> Optional[Tuple[List[str], str]]:
+        if entry.pos != "ADJ":
+            return None
+        forms = self._past_participle_forms(entry.lemma)
+        if forms:
+            return forms, "heuristic-pastpart"
+        return None
+
+    def _heuristic_suffix_compound(self, entry: TermEntry) -> Optional[Tuple[List[str], str]]:
+        if entry.pos != "ADJ":
+            return None
+        normalized = self._strip_adjective_inflection(entry.lemma.lower())
+        for suffix, (english, _) in sorted(
+            self._SUFFIX_RULES.items(), key=lambda item: len(item[0]), reverse=True
+        ):
+            if not normalized.endswith(suffix):
+                continue
+            stem = normalized[: -len(suffix)]
+            if len(stem) < self._SPLIT_MIN_LEFT:
+                continue
+            for variant in self._stem_variants(stem):
+                base_translation = self._component_translation(
+                    variant, allow_present=True, allow_past=True
+                )
+                if base_translation:
+                    combined = self._combine_suffix_translation(base_translation, suffix)
+                    if combined:
+                        return [combined], f"heuristic-compound-{suffix}"
+        return None
+
+    def _heuristic_split_compound(self, entry: TermEntry) -> Optional[Tuple[List[str], str]]:
+        if entry.pos != "ADJ":
+            return None
+        normalized = self._strip_adjective_inflection(entry.lemma.lower())
+        if len(normalized) < self._SPLIT_MIN_LEFT + self._SPLIT_MIN_RIGHT:
+            return None
+        limit = len(normalized) - self._SPLIT_MIN_RIGHT + 1
+        for idx in range(self._SPLIT_MIN_LEFT, limit):
+            left = normalized[:idx]
+            right = normalized[idx:]
+            right_translation = self._component_translation(
+                right, allow_present=True, allow_past=True
+            )
+            if not right_translation:
+                continue
+            left_translation = self._component_translation(
+                left, allow_present=False, allow_past=False
+            )
+            if not left_translation:
+                continue
+            combined = self._combine_component_translations(
+                left_translation, right_translation
+            )
+            if combined:
+                return [combined], "heuristic-compound-split"
+        return None
+
+    def _present_participle_forms(self, word: str) -> List[str]:
+        normalized = self._strip_adjective_inflection(word.lower())
+        if not normalized.endswith("end"):
+            return []
+        stem = normalized[:-3]
+        if len(stem) < 2:
+            return []
+        translations: List[str] = []
+        for candidate in self._present_stem_candidates(stem):
+            lemma_candidate, lexeme = self.lexicon.resolve(candidate, "VERB")
+            glosses: Sequence[str] = ()
+            if lexeme and lexeme.translations_en:
+                glosses = lexeme.translations_en
+            elif self.mt:
+                mt_glosses = self._mt_text(lemma_candidate, source="de", target="en")
+                if mt_glosses:
+                    glosses = mt_glosses
+            if glosses:
+                english = self._build_verb_inflection(glosses, mode="ing")
+                for item in english:
+                    if item not in translations:
+                        translations.append(item)
+                if len(translations) >= self.max_variants:
+                    break
+        return translations[: self.max_variants]
+
+    def _past_participle_forms(self, word: str) -> List[str]:
+        normalized = self._strip_adjective_inflection(word.lower())
+        lemma_candidate, lexeme = self.lexicon.resolve(normalized, "VERB")
+        if not lexeme:
+            return []
+        if lexeme.lemma.lower() == normalized and not normalized.endswith(("t", "en")):
+            return []
+        glosses: Sequence[str] = lexeme.translations_en or ()
+        if not glosses and self.mt:
+            mt_glosses = self._mt_text(lexeme.lemma, source="de", target="en")
+            if mt_glosses:
+                glosses = mt_glosses
+        if not glosses:
+            return []
+        forms = self._build_verb_inflection(glosses, mode="ed")
+        return forms[: self.max_variants]
+
+    def _present_stem_candidates(self, stem: str) -> List[str]:
+        candidates: List[str] = []
+        first = f"{stem}en"
+        if len(first) >= 3:
+            candidates.append(first)
+        second = f"{stem}n"
+        if len(second) >= 3 and second not in candidates:
+            candidates.append(second)
+        return candidates
+
+    def _build_verb_inflection(self, glosses: Sequence[str], mode: str) -> List[str]:
+        results: List[str] = []
+        for gloss in glosses:
+            base = self._extract_primary_gloss(gloss)
+            if not base:
+                continue
+            if mode == "ing":
+                inflected = self._to_ing_form(base)
+            else:
+                inflected = self._to_past_participle_form(base)
+            if inflected and inflected not in results:
+                results.append(inflected)
+            if len(results) >= self.max_variants:
+                break
+        return results
+
+    def _component_translation(
+        self,
+        component: str,
+        *,
+        allow_present: bool,
+        allow_past: bool,
+    ) -> Optional[str]:
+        component = component.strip()
+        if not component:
+            return None
+        if allow_past:
+            past = self._past_participle_forms(component)
+            if past:
+                return past[0]
+        for variant in self._component_variants(component):
+            for pos in ("NOUN", "ADJ", "VERB"):
+                glosses, _ = self.lexicon.get_dictionary_glosses(variant, pos, max_n=1)
+                if glosses:
+                    primary = self._extract_primary_gloss(glosses[0])
+                    if primary:
+                        return primary
+            lemma_candidate, lexeme = self.lexicon.resolve(variant, "VERB")
+            if lexeme and lexeme.translations_en:
+                primary = self._extract_primary_gloss(lexeme.translations_en[0])
+                if primary:
+                    return primary
+        if allow_present:
+            present = self._present_participle_forms(component)
+            if present:
+                return present[0]
+        if allow_past:
+            past = self._past_participle_forms(component)
+            if past:
+                return past[0]
+        if self.mt:
+            mt = self._mt_text(component, source="de", target="en")
+            if mt:
+                primary = self._extract_primary_gloss(mt[0])
+                if primary:
+                    return primary
+        return None
+
+    def _combine_component_translations(self, left: str, right: str) -> Optional[str]:
+        left_clean = left.strip().lower()
+        right_clean = right.strip().lower()
+        if not left_clean or not right_clean:
+            return None
+        return f"{left_clean.replace(' ', '-')}-{right_clean.replace(' ', '-')}"
+
+    def _stem_variants(self, stem: str) -> List[str]:
+        variants = {stem}
+        for ending in ("s", "es", "en", "n", "er"):
+            if stem.endswith(ending) and len(stem) - len(ending) >= self._SPLIT_MIN_LEFT:
+                variants.add(stem[: -len(ending)])
+        if stem and not stem.endswith("e"):
+            variants.add(f"{stem}e")
+        return [variant for variant in variants if len(variant) >= self._SPLIT_MIN_LEFT]
+
+    def _combine_suffix_translation(self, base_translation: str, suffix: str) -> Optional[str]:
+        base = base_translation.strip().lower()
+        if not base:
+            return None
+        english, mode = self._SUFFIX_RULES[suffix]
+        if suffix == "ig":
+            segment = base.replace(" ", "-")
+            if segment.endswith("nose"):
+                return f"{segment}d"
+            if segment.endswith("e") and len(segment) > 3:
+                segment = segment[:-1]
+            return f"{segment}y"
+        if mode == "hyphen":
+            segment = base.replace(" ", "-")
+            return f"{segment}-{english}"
+        root = base.replace(" ", "")
+        if suffix == "bar" and root.endswith("e") and len(root) > 2:
+            root = root[:-1]
+        if suffix == "los" and root.endswith("e") and len(root) > 3:
+            root = root[:-1]
+        return f"{root}{english}"
+
+    @staticmethod
+    def _component_variants(component: str) -> List[str]:
+        variants: List[str] = []
+        for variant in (component, component.lower(), component.capitalize()):
+            if variant and variant not in variants:
+                variants.append(variant)
+        return variants
+
+    def _strip_adjective_inflection(self, word: str) -> str:
+        base = word.strip().lower()
+        changed = True
+        while changed:
+            changed = False
+            for ending in self._ADJ_INFLECTION_ENDINGS:
+                if base.endswith(ending) and len(base) - len(ending) >= 3:
+                    base = base[: -len(ending)]
+                    changed = True
+                    break
+        return base
+
+    @staticmethod
+    def _extract_primary_gloss(gloss: str) -> Optional[str]:
+        if not gloss:
+            return None
+        snippet = re.split(r"[;,/]", gloss, maxsplit=1)[0]
+        snippet = re.sub(r"\s*\(.*?\)\s*$", "", snippet)
+        snippet = snippet.strip()
+        snippet = re.sub(r"^(to|be|the|a|an)\s+", "", snippet, flags=re.IGNORECASE)
+        snippet = snippet.strip()
+        return snippet.lower() or None
+
+    def _to_ing_form(self, base: str) -> Optional[str]:
+        word = base.strip().lower()
+        if not word or " " in word or not re.fullmatch(r"[a-z]+", word):
+            return None
+        if word == "be":
+            return "being"
+        if word.endswith("ie"):
+            return f"{word[:-2]}ying"
+        if word.endswith("e") and not word.endswith(("ee", "oe", "ye")):
+            return f"{word[:-1]}ing"
+        if re.search(r"[aeiou][bcdfghjklmnpqrstvwxyz]$", word) and word[-1] not in "wxy":
+            return f"{word}{word[-1]}ing"
+        return f"{word}ing"
+
+    def _to_past_participle_form(self, base: str) -> Optional[str]:
+        word = base.strip().lower()
+        if not word or " " in word or not re.fullmatch(r"[a-z]+", word):
+            return None
+        irregular = self._IRREGULAR_PARTICIPLES.get(word)
+        if irregular:
+            return irregular
+        if word.endswith("ie"):
+            return f"{word[:-2]}ied"
+        if word.endswith("y") and word[-2:] not in {"ay", "ey", "iy", "oy", "uy"}:
+            return f"{word[:-1]}ied"
+        if word.endswith("e"):
+            if word.endswith(("ee", "oe", "ye")):
+                return f"{word}d"
+            return f"{word[:-1]}ed"
+        if re.search(r"[aeiou][bcdfghjklmnpqrstvwxyz]$", word) and word[-1] not in "wxy":
+            return f"{word}{word[-1]}ed"
+        return f"{word}ed"
 
 
 
@@ -803,6 +1179,37 @@ def prune_pos_variants(entries: List[TermEntry]) -> List[TermEntry]:
     return list(best.values())
 
 
+def filter_inflected_adjectives(entries: List[TermEntry]) -> List[TermEntry]:
+    endings = ("en", "em", "er", "es", "e")
+    base_map: Dict[str, TermEntry] = {}
+    for entry in entries:
+        key = entry.lemma.lower()
+        if key not in base_map:
+            base_map[key] = entry
+    filtered: List[TermEntry] = []
+    for entry in entries:
+        if entry.pos != "ADJ":
+            filtered.append(entry)
+            continue
+        lemma_lower = entry.lemma.lower()
+        remove = False
+        for ending in endings:
+            if lemma_lower.endswith(ending) and len(lemma_lower) - len(ending) >= 3:
+                base_key = lemma_lower[: -len(ending)]
+                base_entry = base_map.get(base_key)
+                if (
+                    base_entry
+                    and base_entry is not entry
+                    and base_entry.pos == "ADJ"
+                    and base_entry.translations
+                ):
+                    remove = True
+                    break
+        if not remove:
+            filtered.append(entry)
+    return filtered
+
+
 def normalize_plural_form(form: str) -> str:
     cleaned = unicodedata.normalize("NFC", form.strip())
     cleaned = ARTICLE_PATTERN.sub("", cleaned)
@@ -1024,20 +1431,31 @@ def process_book(
 
         translator.translate_entry(entry)
 
+    filtered_entries = filter_inflected_adjectives(entry_list)
+    if len(filtered_entries) != len(entry_list):
+        entry_list = filtered_entries
+
     total_entries = len(entry_list)
     dict_en = sum(1 for entry in entry_list if entry.translation_source == "dictionary-en")
+    heuristic = sum(
+        1
+        for entry in entry_list
+        if (entry.translation_source or "").startswith("heuristic-")
+    )
     mt_de_en = sum(1 for entry in entry_list if entry.translation_source == "mt-de-en")
-    dict_none = max(total_entries - (dict_en + mt_de_en), 0)
+    dict_none = max(total_entries - (dict_en + heuristic + mt_de_en), 0)
     if total_entries:
         pct_en = dict_en / total_entries * 100
+        pct_heuristic = heuristic / total_entries * 100
         pct_mt = mt_de_en / total_entries * 100
         pct_none = dict_none / total_entries * 100
     else:
-        pct_en = pct_mt = pct_none = 0.0
+        pct_en = pct_heuristic = pct_mt = pct_none = 0.0
     LOGGER.info(
-        "Coverage %s: EN %.1f%% | MT(DE\u2192EN) %.1f%% | none %.1f%%",
+        "Coverage %s: EN %.1f%% | heuristic %.1f%% | MT(DE\u2192EN) %.1f%% | none %.1f%%",
         path.name,
         pct_en,
+        pct_heuristic,
         pct_mt,
         pct_none,
     )
@@ -1046,6 +1464,7 @@ def process_book(
             e
             for e in entry_list
             if e.translation_source in {"dictionary-en", "mt-de-en"}
+            or (e.translation_source or "").startswith("heuristic-")
         ][:5]
         for ex in examples:
             LOGGER.debug("Example translation: %s [%s] -> %s (%s)", ex.lemma, ex.pos, ex.translations, ex.translation_source)
