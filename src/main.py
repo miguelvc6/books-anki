@@ -169,35 +169,33 @@ class WiktextractLexicon:
                     ):
                         if tag in tags and tag not in entry.verb_forms:
                             entry.verb_forms[tag] = form_text
+                def _append_translation(data_obj: dict) -> None:
+                    lang_code = (
+                        data_obj.get("lang_code")
+                        or data_obj.get("language_code")
+                        or data_obj.get("lang")
+                    )
+                    lang = str(lang_code).lower() if isinstance(lang_code, str) else None
+                    if lang not in {"en", "eng", "english"}:
+                        return
+                    word = data_obj.get("word")
+                    if not word:
+                        return
+                    note_bits: List[str] = []
+                    for key_name in ("sense", "usage", "note", "tags"):
+                        value = data_obj.get(key_name)
+                        if isinstance(value, str):
+                            note_bits.append(value)
+                        elif isinstance(value, Sequence):
+                            note_bits.extend(str(x) for x in value)
+                    formatted = f"{word} ({'; '.join(note_bits)})" if note_bits else word
+                    formatted = formatted.strip()
+                    if formatted:
+                        entry.translations_en.append(formatted)
+
                 for sense in blob.get("senses", []) or []:
                     for translation in sense.get("translations", []) or []:
-                        lang_code = (
-                            translation.get("lang_code")
-                            or translation.get("language_code")
-                            or translation.get("lang")
-                        )
-                        lang = str(lang_code).lower() if isinstance(lang_code, str) else None
-                        target_list: List[str]
-                        if lang not in {"en", "eng", "english"}:
-                            continue
-                        target_list = entry.translations_en
-                        word = translation.get("word")
-                        if not word:
-                            continue
-                        note_bits: List[str] = []
-                        for key_name in ("sense", "usage", "note", "tags"):
-                            value = translation.get(key_name)
-                            if isinstance(value, str):
-                                note_bits.append(value)
-                            elif isinstance(value, Sequence):
-                                note_bits.extend(str(x) for x in value)
-                        if note_bits:
-                            formatted = f"{word} ({'; '.join(note_bits)})"
-                        else:
-                            formatted = word
-                        formatted = formatted.strip()
-                        if formatted and formatted not in target_list:
-                            target_list.append(formatted)
+                        _append_translation(translation)
                     if is_german_dump:
                         for gloss in sense.get("glosses") or []:
                             if not isinstance(gloss, str):
@@ -207,6 +205,8 @@ class WiktextractLexicon:
                                 continue
                             if g not in entry.definitions_de:
                                 entry.definitions_de.append(g)
+                for translation in blob.get("translations") or []:
+                    _append_translation(translation)
                 entry.translations_en = _dedup_keep_order(entry.translations_en)
                 if (
                     LOGGER.isEnabledFor(logging.DEBUG)
